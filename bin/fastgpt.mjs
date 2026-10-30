@@ -16,6 +16,23 @@ import { compareRuleset, calibrateRuleset, DIAGNOSTIC_CODES } from '../lib/rules
 
 const out = o => console.log(JSON.stringify(o, null, 2));
 
+// 画布校验指纹：只取影响渲染的结构（节点类型/输入项 key 与类型/modelId/连线/应用配置），
+// 排除 prompt 等文本内容 —— 改提示词不该触发 9 秒的画布重校验。
+const canvasFingerprint = async (appId, nodes, edges, chatConfig) => {
+  const crypto = await import('node:crypto');
+  const shape = {
+    nodes: (nodes || []).map(n => ({
+      t: n.flowNodeType, id: n.nodeId,
+      k: (n.inputs || []).map(i => `${i.key}:${i.valueType || ''}`),
+      m: (n.inputs || []).find(i => i.key === 'modelId')?.value || '',
+      o: (n.outputs || []).map(o => `${o.key}:${o.valueType || ''}`),
+    })),
+    edges: (edges || []).map(e => `${e.source}>${e.target}:${e.sourceHandle || ''}`),
+    cfg: chatConfig || {},
+  };
+  return crypto.createHash('sha1').update(appId + JSON.stringify(shape)).digest('hex').slice(0, 16);
+};
+
 /** 结构化失败：subtype 必须在 errors.mjs 注册表中 */
 const failCli = (subtype, overrides = {}) => {
   const err = cliError(subtype, overrides);
@@ -1363,10 +1380,11 @@ const commands = {
     const published = wf.raw.publish !== false;
     await deployWorkflow({ appId, nodes, edges, chatConfig, versionName: wf.raw.versionName, publish: published });
 
-    // 画布校验：部署成功 ≠ 前端能渲染。默认必跑，--no-ui-check 才跳过
+    // 画布校验：部署成功 ≠ 前端能渲染。默认必跑；结构指纹相同则 5 分钟内复用结果
+    const fingerprint = await canvasFingerprint(appId, nodes, edges, chatConfig);
     const ui = f['no-ui-check']
       ? { ok: true, skipped: '--no-ui-check 显式跳过', verdict: 'skipped' }
-      : await checkCanvas(appId, { base: getBase() });
+      : await checkCanvas(appId, { base: getBase(), fingerprint, noCache: f['no-ui-cache'] === false });
     if (!ui.ok) {
       failCli('canvas_render_failed', {
         message: '工作流已部署，但前端画布渲染不出来',
@@ -1615,8 +1633,10 @@ const commands = {
       } else if (f['no-ui-check']) {
         push('ui', true, { skipped: '--no-ui-check 显式跳过' });
       } else {
-        const ui = await checkCanvas(appId, { base: getBase() });
-        push('ui', ui.ok, { verdict: ui.verdict, nodesFound: ui.nodesFound, errors: ui.errors, skipped: ui.skipped });
+        const fp = await canvasFingerprint(appId, nodes, edges, chatConfig);
+        const ui = await checkCanvas(appId, { base: getBase(), fingerprint: fp });
+        push('ui', ui.ok, { verdict: ui.verdict, nodesFound: ui.nodesFound, errors: ui.errors,
+                            skipped: ui.skipped, cached: ui.cached || undefined });
         if (!ui.ok) {
           await stop('ui', '画布渲染不出来（部署成功但前端报错/空白）', {
             nodesFound: ui.nodesFound, errors: ui.errors, sample: ui.sample,
