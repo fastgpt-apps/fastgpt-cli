@@ -11,6 +11,7 @@ import { ensureAuth, scanLogin, resumeScan, passwordLogin, checkAuth, isAuthErro
 import { node } from '../lib/nodes.mjs';
 import { edge, validateWorkflow, normalizeWorkflow } from '../lib/validate.mjs';
 import { diffWorkflow } from '../lib/diff.mjs';
+import { checkCanvas } from '../lib/ui-check.mjs';
 import { compareRuleset, calibrateRuleset, DIAGNOSTIC_CODES } from '../lib/ruleset.mjs';
 
 const out = o => console.log(JSON.stringify(o, null, 2));
@@ -57,7 +58,7 @@ const COMMAND_DOC = {
     examples: ['fastgpt wf lint wf.json --fix fixed.json --inline-consts']
   },
   'wf build': {
-    usage: 'fastgpt wf build <file> [--dry-run] [--no-inline-consts] [--appId <id>]',
+    usage: 'fastgpt wf build <file> [--dry-run] [--no-inline-consts] [--no-ui-check] [--appId <id>]',
     about: '规范化 + 校验 + 提交发布。默认会自动内联 canEdit 常量。',
     flags: {
       '--dry-run': '只校验不写库（仍然需要登录，因为要验证 modelId/datasetId 真实性）',
@@ -74,7 +75,8 @@ const COMMAND_DOC = {
       '--appId <id>': '对指定应用跑（会写入），不给则建影子应用',
       '--inline-consts': '同 lint',
       '--variables <json>': '跑运行时用的入参',
-      '--ui-cmd <cmd>': '外挂前端校验命令，{appId} 会被替换',
+      '--ui-cmd <cmd>': '外挂前端校验命令，{appId} 会被替换（默认已内置画布校验，一般不需要）',
+      '--no-ui-check': '跳过内置画布渲染校验（不推荐：跳过会漏掉「服务端能跑、界面全错」的问题）',
       '--keep': '保留影子应用便于排查'
     },
     output: 'verdict:all_passed | {ok:false, failedAt, hint, steps}',
@@ -1360,7 +1362,21 @@ const commands = {
 
     const published = wf.raw.publish !== false;
     await deployWorkflow({ appId, nodes, edges, chatConfig, versionName: wf.raw.versionName, publish: published });
-    const payload = { ok: true, appId, nodes: nodes.length, edges: edges.length, publish: published, warnings: v.warnings };
+
+    // 画布校验：部署成功 ≠ 前端能渲染。默认必跑，--no-ui-check 才跳过
+    const ui = f['no-ui-check']
+      ? { ok: true, skipped: '--no-ui-check 显式跳过', verdict: 'skipped' }
+      : await checkCanvas(appId, { base: getBase() });
+    if (!ui.ok) {
+      failCli('canvas_render_failed', {
+        message: '工作流已部署，但前端画布渲染不出来',
+        details: { appId, verdict: ui.verdict, nodesFound: ui.nodesFound, errors: ui.errors, sample: ui.sample },
+        nextCommand: `fastgpt wf get ${appId} > wf.json   # 对照 SKILL.md「红线三：前端不认的写法」逐条核`,
+      });
+    }
+
+    const payload = { ok: true, appId, nodes: nodes.length, edges: edges.length, publish: published,
+                      warnings: v.warnings, ui };
     out(published ? payload : withNotice(payload, Notice.notPublished()));
   },
 
@@ -1585,7 +1601,7 @@ const commands = {
         if (!r.ok) stop('run', '运行时不通过：变量没替换或契约异常', r);
       }
 
-      // ⑦ 可选 UI 校验（外挂命令，保持 CLI 零依赖；{appId} 会被替换）
+      // ⑦ UI 校验：默认内置画布渲染检查；--ui-cmd 可外挂更细的检查
       if (f['ui-cmd']) {
         const { execSync } = await import('node:child_process');
         const cmd = String(f['ui-cmd']).replace(/\{appId\}/g, appId);
@@ -1595,6 +1611,17 @@ const commands = {
         } catch (e) {
           push('ui', false, { cmd, exit: e.status });
           await stop('ui', 'UI 校验未通过（前端仍有报错/裸变量/缺芯片）', { tail: String(e.stdout || e.stderr || '').trim().slice(-1500) });
+        }
+      } else if (f['no-ui-check']) {
+        push('ui', true, { skipped: '--no-ui-check 显式跳过' });
+      } else {
+        const ui = await checkCanvas(appId, { base: getBase() });
+        push('ui', ui.ok, { verdict: ui.verdict, nodesFound: ui.nodesFound, errors: ui.errors, skipped: ui.skipped });
+        if (!ui.ok) {
+          await stop('ui', '画布渲染不出来（部署成功但前端报错/空白）', {
+            nodesFound: ui.nodesFound, errors: ui.errors, sample: ui.sample,
+            hint: '对照 SKILL.md「红线三：前端不认的写法」；确认 chatConfig.fileSelectConfig 等应用级配置'
+          });
         }
       }
     } finally {

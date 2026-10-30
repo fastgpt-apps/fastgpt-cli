@@ -52,6 +52,33 @@ description: "管理 FastGPT 的唯一推荐方式。工作流必须用本 CLI �
 
 发布前必须 `wf check-run` 再看一遍，因为**服务端兼容裸写法**，功能正常不代表界面正常。
 
+### ✅ 画布校验已内置（0.2.1 起，不需要再手动 `--ui-cmd`）
+
+`wf build` 与 `wf verify` 在部署完成后会**自动起一个隔离的 headless Chrome**，
+注入 cookie 打开 `app/detail?appId=…`，读真实渲染后的 DOM，判定：
+
+| 判定 | 含义 | 结果 |
+|---|---|---|
+| `canvas_renders` | 画布专有文本 + ≥2 个节点名，无报错 | 通过 |
+| `canvas_broken` | 停在画布但报错/空白 | **失败**，返回 `canvas_render_failed` |
+| `app_unreachable` | 被重定向出画布（应用不存在/无权限） | **失败** |
+| `skipped` | 无 Chrome / cookie 失效 / 显式 `--no-ui-check` | 放行并注明 |
+
+失败时错误 envelope 直接给修法：
+
+```
+hint: 部署成功只代表服务端接受，不代表前端能渲染。按「红线三」逐条核：
+      1) 裸变量占位 {{X}} → {{$VARIABLE_NODE_ID.X$}}
+      2) canEdit:true 存常量 → 内联后删掉该输入项
+      3) system_addInputParam.value = null → []
+      4) ifElseList[].list[].value = true → 存 "true"
+      还有一类：应用级配置缺失（如 chatConfig.fileSelectConfig 没开 → 上传被禁用）
+forbidden: 不要用 --no-ui-check 跳过校验让命令通过
+```
+
+**因此：不要再手拼原生 nodes/edges。** 画布校验能拦住"界面全错"，拦不住"你压根没写应用级配置"——
+`withFiles:true` 必须配 `chatConfig.fileSelectConfig`，否则文件上传直接 `FileUploadDisabled`。
+
 **判断信息该放哪**（写一次省很多次）：
 - 决定「下一步动作」→ 错误 envelope 的 `hint`（要到命令级，不要写"逐项修正"这种废话）
 - 「这个错具体怎么改」→ `details.issues[].message` + `fix` 标记，让 agent 按 code 分支
@@ -61,7 +88,7 @@ description: "管理 FastGPT 的唯一推荐方式。工作流必须用本 CLI �
 ### 交付前的唯一入口：`wf verify`
 
 ```
-fastgpt wf verify <file> [--inline-consts] [--variables '{...}'] [--ui-cmd '...{appId}...'] [--appId <id>] [--keep]
+fastgpt wf verify <file> [--inline-consts] [--variables '{...}'] [--ui-cmd '...{appId}...'] [--no-ui-check] [--appId <id>] [--keep]
 ```
 默认影子应用，七步 lint→validate→deploy→diff→run→ui→cleanup，任一步失败即停并带 `failedAt` + `hint`。
 **不要再手工拼 lint/build/diff/check-run**——顺序（尤其 UI 后要重跑 diff）已经固化在里面。
