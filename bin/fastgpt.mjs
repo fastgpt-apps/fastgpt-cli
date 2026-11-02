@@ -1194,9 +1194,17 @@ const commands = {
       },
       variables: {
         path: 'chatConfig.variables[]',
-        fields: { key: '变量名', label: '显示名', type: 'string | number | boolean' },
+        fields: {
+          key: '变量名，prompt/question 里用它引用',
+          label: '画布上显示的名字',
+          type: '★ 声明类型，固定填空串 "input"（不是数据类型！）',
+          valueType: '值的类型："string" | "number" | "boolean"',
+          required: 'boolean，是否必填',
+          description: 'string，给调用方看的说明',
+        },
         usage: '在 prompt/question 里引用写 ["VARIABLE_NODE_ID", "<key>"]',
-        example: [{ key: 'type', label: '任务类型', type: 'string' }],
+        example: [{ key: 'type', label: '任务类型', type: 'input', valueType: 'string', required: false, description: 'parse/outline/extract/compose' }],
+        warning: '写成 { type: "string" } 会 400 "Data validation error" —— type 是声明类型，数据类型放 valueType',
       },
       nodeTypes: pick,
       tips: [
@@ -1692,6 +1700,17 @@ const commands = {
     try {
       // ③ 校验 + ID 真实性
       let { nodes, edges, chatConfig } = lint;
+
+      // ★ 内在参数自动调整：必须和 wf build 走同一步。
+      //   漏了这步，简化 DSL 里没显式写 responseText 的 chat 节点会带着
+      //   isResponseAnswerText: null 提交，平台直接回 "Data validation error"。
+      const tuned = autoTuneNodeParams(nodes);
+      if (tuned.length) {
+        push('auto_tune', true, {
+          changes: tuned.map(c => `${c.node}.${c.param}: ${c.from === undefined ? '(未设置)' : c.from} → ${c.to}`),
+        });
+      }
+
       if (!f['no-model-hook']) nodes = await ensureModelIdHook(nodes, { autoFill: !f['no-auto-model'] });
       const v = validateWorkflow({ nodes, edges, chatConfig });
       if (!v.ok) { push('validate', false, { errors: v.errors }); stop('validate', v.next, { issues: v.issues }); }
