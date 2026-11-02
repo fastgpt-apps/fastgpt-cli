@@ -274,16 +274,103 @@ fastgpt chat run --appId <APP_ID> -q "你好" --detail
 
 ### 知识库
 
-```bash
-fastgpt ds create --name "产品文档"                     # 建库
-fastgpt ds collections <datasetId>                      # 列出集合
-fastgpt ds import <datasetId> <collectionId> ./doc.pdf  # 传文档
-fastgpt ds training <collectionId>                      # 看训练进度
-fastgpt ds search <datasetId> "怎么退款"                 # 试检索
+八种类型全部支持，`--type` 不给就是普通库：
 
-# QA 问答对
-fastgpt ds qa import <collectionId> ./qa.csv
+| type | 用途 | 关键参数 |
+|---|---|---|
+| `dataset` | 普通知识库（默认） | — |
+| `folder` | 文件夹（归类用，不存文档） | — |
+| `websiteDataset` | 网站同步库 | `--website-url` `--website-selector` |
+| `apiDataset` | 第三方 API 知识库 | `--api-base` `--api-token` |
+| `feishu` / `yuque` / `dingtalk` | 飞书 / 语雀 / 钉钉 | 对应 `--feishu-*` `--yuque-*` `--dd-*` |
+| `externalFile` | 外部文件库（旧） | — |
+
+```bash
+# 建库 + 分块配置
+fastgpt ds create --name "产品文档" --chunk-size 1200 --index-size 800 --split-mode size
+fastgpt ds create --name "归类目录" --type folder
+fastgpt ds create --name "官网" --type websiteDataset --website-url https://x.com --website-selector article
+
+# 改配置（名称 / 模型 / 分块 / 网站 / 自动同步）
+fastgpt ds update <datasetId> --name "新名字" --chunk-size 800 --auto-sync on
+fastgpt ds detail <datasetId>          # 完整快照：模型/分块/网站/第三方/autoSync
 ```
+
+> 分块参数注意：服务端默认 `chunkSettingMode=auto`，会强行把 `chunkSize/indexSize/splitMode` 换成系统默认值。CLI 已自动处理 —— 只给 `--chunk-size` 不写 `--setting-mode` 时自动补 `custom`，参数不会被默默丢掉。
+
+### 集合（文档）
+
+```bash
+fastgpt ds collections <datasetId> [--parent-id 目录] [--type apiFile|folder] [--search 词]
+
+fastgpt ds add-file    <datasetId> ./doc.pdf                     # 单文件
+fastgpt ds add-batch   <datasetId> ./docs --ext pdf,docx,md      # 批量递归
+fastgpt ds add-text    <datasetId> --name 标题 --text 内容
+fastgpt ds add-link    <datasetId> https://x.com --selector article
+fastgpt ds add-images  <datasetId> a.png b.jpg --name 图集        # 多模态图片集
+fastgpt ds add-backup  <datasetId> table.csv [--mode backup|template]  # CSV/Excel 表格
+fastgpt ds add-qa      <datasetId> --file qa.json [--q --a]      # QA 问答对
+
+fastgpt ds training <collectionId>     # 训练进度（done=true 才可检索）
+fastgpt ds data     <collectionId>     # 看切分后的数据块
+fastgpt ds retrain  <collectionId>     # 重训（会生成新 collectionId）
+fastgpt ds sync     <collectionId>     # 单集合重拉正文（网页/第三方库）
+fastgpt ds search   <datasetId> "怎么退款"
+```
+
+> `ds sync` 只重拉**这一个集合**的正文。扫描新增文件是库级的活（第三方库走 `ds api-sync`，否则等 24h 自动同步）。
+
+### 第三方知识库（API 知识库）
+
+`--type apiDataset` 建的不是普通文档库：FastGPT **只存索引，文件正文留在你的系统**。
+建库时必须绑定一个「服务端」，四种任选其一：
+
+| 服务端 | 参数 | 说明 |
+|---|---|---|
+| 自定义 API | `--api-base URL --api-token TOKEN` | 你自己实现 4 个接口，见下 |
+| 语雀 | `--yuque-user U --yuque-token T` | 直接读语雀知识库 |
+| 飞书 | `--feishu-app-id A --feishu-secret S --feishu-folder F` | 读飞书云文档目录 |
+| 钉钉 | `--dd-app-key K --dd-app-secret S --dd-user-id U` | 读钉钉知识库 |
+
+```bash
+# 1. 建库并绑定服务端（以自定义 API 为例）
+fastgpt ds create --name "API文件知识库" --type apiDataset \
+  --api-base https://kb.example.com --api-token my-token
+
+# 2. 看/改绑定（不传 token 不会清掉已有 token）
+fastgpt ds api-info <datasetId>
+fastgpt ds api-config <datasetId> --api-base https://kb2.example.com --auto-sync on
+
+# 3. 浏览远端文件树
+fastgpt ds api-files <datasetId> --search 年报
+
+# 4. 导入：单个文件 / 整个目录树
+fastgpt ds api-import <datasetId> --file-id doc_123
+fastgpt ds api-sync <datasetId> --parent-id folder_ops --depth 3   # 递归，幂等
+
+# 5. 训练完验证（apiFile 集合训练同样是异步的）
+fastgpt ds collections <datasetId>
+fastgpt ds training <collectionId>
+fastgpt ds search <datasetId> "怎么退款"
+```
+
+自定义 API 服务只需实现 4 个接口（统一 `{success, message, data}`，`Authorization: Bearer <token>`）：
+
+| 接口 | 作用 | 返回 |
+|---|---|---|
+| `POST /v1/file/list` | 列目录，入参 `{searchKey, parentId}` | `[{id, name, type, hasChild, updateTime, createTime}]` |
+| `GET /v1/file/detail?id=` | 文件详情 | `{id, name, type, parentId, hasChild, ...}` |
+| `GET /v1/file/content?id=` | 正文，FastGPT 拿它切分训练 | `{title, content}` 或 `{title, previewUrl}` |
+| `GET /v1/file/read?id=` | 预览地址 | `{url}` |
+
+现成骨架：`examples/api-dataset-server.mjs`，把本地目录直接暴露成知识库：
+
+```bash
+KB_DIR=./docs KB_TOKEN=my-token PORT=18080 node examples/api-dataset-server.mjs
+cloudflared tunnel --url http://127.0.0.1:18080     # SaaS 版要公网可达
+```
+
+> 私有化部署可以直接填内网地址；SaaS 版填 `127.0.0.1` 会连不上（那是服务端自己的回环）。
 
 ### 发布
 

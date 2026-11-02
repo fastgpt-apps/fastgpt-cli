@@ -563,6 +563,89 @@ function buildFromDsl(dsl) {
 }
 
 
+// ---------- 第三方知识库（apiDataset）----------
+/** flag 名 -> 服务端字段名。FastGPT 的第三方知识库四种服务端互斥 */
+const API_SERVER_FLAGS = {
+  apiServer:      { baseUrl: 'api-base', authorization: 'api-token', basePath: 'api-base-path' },
+  yuqueServer:    { userId: 'yuque-user', token: 'yuque-token', basePath: 'yuque-base-path' },
+  feishuServer:   { appId: 'feishu-app-id', appSecret: 'feishu-secret', folderToken: 'feishu-folder' },
+  dingtalkServer: { appKey: 'dd-app-key', appSecret: 'dd-app-secret', userId: 'dd-user-id',
+                    operatorId: 'dd-operator-id', workspaceId: 'dd-workspace-id', rootNodeId: 'dd-root-node' }
+};
+
+/** 从 flags 拼出 ApiDatasetServer。一个都没给时返回 undefined（表示不改） */
+function buildApiDatasetServer(f) {
+  const built = {};
+  for (const [serverKey, map] of Object.entries(API_SERVER_FLAGS)) {
+    const obj = {};
+    for (const [field, flag] of Object.entries(map)) {
+      const v = f[flag];
+      if (v !== undefined && v !== true) obj[field] = v;
+    }
+    if (Object.keys(obj).length) built[serverKey] = obj;
+  }
+  const keys = Object.keys(built);
+  if (keys.length > 1) fail(`第三方知识库只能配一种服务端，当前同时给了：${keys.join(' + ')}`);
+  return keys.length ? built : undefined;
+}
+
+const DATASET_TYPES = ['folder', 'dataset', 'websiteDataset', 'apiDataset', 'feishu', 'yuque', 'dingtalk', 'externalFile'];
+
+/** 第三方服务端 flag -> 对应的知识库 type（给了就不用手写 --type） */
+const SERVER_TYPE_MAP = {
+  apiServer: 'apiDataset', yuqueServer: 'yuque', feishuServer: 'feishu', dingtalkServer: 'dingtalk'
+};
+
+const AVATAR_BY_TYPE = {
+  folder: 'core/dataset/folderColor',
+  dataset: 'core/dataset/commonDatasetColor',
+  websiteDataset: 'core/dataset/websiteDatasetColor',
+  apiDataset: 'core/dataset/externalDatasetColor',
+  feishu: 'core/dataset/feishuDatasetColor',
+  yuque: 'core/dataset/yuqueDatasetColor',
+  dingtalk: 'core/dataset/dingtalkDatasetColor',
+  externalFile: 'core/dataset/externalDatasetColor'
+};
+
+const onOff = (v) => {
+  if (v === undefined) return undefined;
+  const s = String(v).toLowerCase();
+  if (['on', 'true', '1', 'yes'].includes(s)) return true;
+  if (['off', 'false', '0', 'no'].includes(s)) return false;
+  return null;
+};
+
+/** 分块/训练参数 -> chunkSettings。一个都没给时返回 undefined */
+function buildChunkSettings(f) {
+  const s = {};
+  if (f['training-type']) s.trainingType = f['training-type'];
+  if (f['chunk-size']) s.chunkSize = Number(f['chunk-size']);
+  if (f['index-size']) s.indexSize = Number(f['index-size']);
+  if (f['chunk-splitter']) s.chunkSplitter = f['chunk-splitter'];
+  if (f['split-mode']) s.chunkSplitMode = f['split-mode'];
+  if (f['setting-mode']) s.chunkSettingMode = f['setting-mode'];
+  if (f['qa-prompt']) s.qaPrompt = f['qa-prompt'];
+  for (const [flag, key] of [['auto-indexes', 'autoIndexes'], ['image-index', 'imageIndex'],
+                             ['index-prefix-title', 'indexPrefixTitle'], ['enhance-name', 'dataEnhanceCollectionName']]) {
+    const v = onOff(f[flag]);
+    if (v === null) fail(`--${flag} 只能是 on / off`);
+    if (v !== undefined) s[key] = v;
+  }
+  // 服务端默认 chunkSettingMode=auto，会强行把 chunkSize/indexSize/splitMode 覆盖成系统默认值。
+  // 给了任何自定义参数却没写 --setting-mode 时自动补 custom，否则参数会被默默丢掉。
+  const customFlags = ['chunk-size', 'index-size', 'chunk-splitter', 'split-mode'];
+  if (!f['setting-mode'] && customFlags.some((k) => f[k] !== undefined)) {
+    s.chunkSettingMode = 'custom';
+  }
+  return Object.keys(s).length ? s : undefined;
+}
+
+/** 网站知识库的抓取配置 */
+function buildWebsiteConfig(f) {
+  if (!f['website-url']) return undefined;
+  return { url: f['website-url'], selector: f['website-selector'] || 'body' };
+}
+
 // ---------- 命令实现 ----------
 
 const commands = {
@@ -2222,13 +2305,178 @@ const commands = {
     out((d || []).map(x => ({ _id: x._id, name: x.name, type: x.type, vectorModel: x.vectorModel?.name })));
   },
 
+  /**
+   * 建知识库。八种类型全覆盖，第三方类可直接顺手把服务端带上。
+   *   ds create --name 产品文档                          # 普通库
+   *   ds create --name 目录 --type folder                 # 文件夹
+   *   ds create --name 官网 --type websiteDataset --website-url https://x.com --website-selector article
+   *   ds create --name 语雀库 --yuque-user u --yuque-token t   # type 自动推导
+   */
   async 'ds create'(args, f) {
     if (!f.name) fail('需要 --name');
-    const id = await client.post('/api/core/dataset/create', {
-      parentId: f.parentId || null, name: f.name, type: 'dataset', intro: f.intro || '',
-      avatar: f.avatar || 'core/dataset/commonDatasetColor'
+    const server = buildApiDatasetServer(f);
+    // 没显式给 --type 时，根据服务端参数推导第三方类型
+    const inferred = server ? SERVER_TYPE_MAP[Object.keys(server)[0]] : undefined;
+    const type = f.type || inferred || 'dataset';
+    if (!DATASET_TYPES.includes(type)) fail(`--type 只能是 ${DATASET_TYPES.join(' / ')}`);
+
+    const body = {
+      parentId: f['parent-id'] || f.parentId || null,
+      name: f.name,
+      type,
+      intro: f.intro || '',
+      avatar: f.avatar || AVATAR_BY_TYPE[type] || 'core/dataset/commonDatasetColor'
+    };
+    if (f['vector-model-id']) body.vectorModelId = f['vector-model-id'];
+    if (f['agent-model-id']) body.agentModelId = f['agent-model-id'];
+    if (f['vlm-model-id']) body.vlmModelId = f['vlm-model-id'];
+
+    // 第三方服务端：只有四种第三方 type 能用
+    const thirdParty = ['apiDataset', 'feishu', 'yuque', 'dingtalk'];
+    if (server) {
+      if (!thirdParty.includes(type)) fail(`服务端参数只能配 ${thirdParty.join(' / ')} 类型`);
+      body.apiDatasetServer = server;
+    }
+
+    const id = await client.post('/api/core/dataset/create', body);
+
+    // create 接口不接 websiteConfig / chunkSettings，建完再 udpate 一次
+    const patch = {};
+    if (type === 'websiteDataset') {
+      const websiteConfig = buildWebsiteConfig(f);
+      if (!websiteConfig) fail('--type websiteDataset 需要 --website-url（可选 --website-selector）');
+      patch.websiteConfig = websiteConfig;
+    }
+    const chunkSettings = buildChunkSettings(f);
+    if (chunkSettings) patch.chunkSettings = chunkSettings;
+    if (f['auto-sync'] !== undefined) {
+      const v = onOff(f['auto-sync']);
+      if (v === null) fail('--auto-sync 只能是 on / off');
+      patch.autoSync = v;
+    }
+    if (Object.keys(patch).length) {
+      await client.post('/api/core/dataset/update', { id, ...patch });
+    }
+
+    out({
+      ok: true, datasetId: id, type,
+      avatar: body.avatar,
+      ...(server ? { apiDatasetServer: server } : {}),
+      ...(patch.websiteConfig ? { websiteConfig: patch.websiteConfig } : {}),
+      ...(patch.chunkSettings ? { chunkSettings: patch.chunkSettings } : {}),
+      ...(patch.autoSync !== undefined ? { autoSync: patch.autoSync } : {}),
+      ...(server && !f['auto-sync'] ? { _notice: '第三方知识库建议开 --auto-sync on，否则新增文件要手动 ds api-sync' } : {})
     });
-    out({ ok: true, datasetId: id });
+  },
+
+  /** 改知识库配置：名称/简介/模型/网站/分块/自动同步。只传要改的字段 */
+  async 'ds update'(args, f) {
+    const datasetId = f.datasetId || args[0];
+    if (!datasetId) fail('用法: ds update <datasetId> [--name N] [--intro I] [--avatar A] [--agent-model-id M] [--vlm-model-id M] [--website-url U --website-selector S] [--chunk-size N] [--auto-sync on|off]');
+    const body = { id: datasetId };
+    if (f.name) body.name = f.name;
+    if (f.intro !== undefined) body.intro = f.intro;
+    if (f.avatar) body.avatar = f.avatar;
+    if (f['agent-model-id']) body.agentModelId = f['agent-model-id'];
+    if (f['vlm-model-id'] !== undefined) body.vlmModelId = f['vlm-model-id'];
+    const websiteConfig = buildWebsiteConfig(f);
+    if (websiteConfig) body.websiteConfig = websiteConfig;
+    const chunkSettings = buildChunkSettings(f);
+    if (chunkSettings) body.chunkSettings = chunkSettings;
+    const sync = onOff(f['auto-sync']);
+    if (sync === null) fail('--auto-sync 只能是 on / off');
+    if (sync !== undefined) body.autoSync = sync;
+
+    if (Object.keys(body).length === 1) fail('没有要改的字段');
+    await client.post('/api/core/dataset/update', body);
+    const d = await client.get(`/api/core/dataset/detail?id=${datasetId}`);
+    out({
+      ok: true, datasetId, name: d.name, type: d.type,
+      vectorModel: d.vectorModel?.name, agentModel: d.agentModel?.name,
+      websiteConfig: d.websiteConfig || null, autoSync: d.autoSync ?? null,
+      chunkSettings: d.chunkSettings || null
+    });
+  },
+
+  /** 查看/更新第三方知识库的服务端绑定 */
+  async 'ds api-config'(args, f) {
+    const datasetId = f.datasetId || args[0];
+    if (!datasetId) fail('用法: ds api-config <datasetId> [--api-base URL --api-token T | --yuque-user U --yuque-token T | --feishu-app-id A --feishu-secret S --feishu-folder F | --dd-app-key K ...] [--auto-sync on|off]');
+    const server = buildApiDatasetServer(f);
+    const syncRaw = f['auto-sync'];
+    if (!server && syncRaw === undefined) fail('没有要更新的字段：给服务端参数或 --auto-sync on|off');
+    const body = { id: datasetId };
+    if (server) body.apiDatasetServer = server;
+    if (syncRaw !== undefined) {
+      const v = String(syncRaw).toLowerCase();
+      if (v !== 'on' && v !== 'off') fail('--auto-sync 只能是 on / off');
+      body.autoSync = v === 'on';
+    }
+    await client.post('/api/core/dataset/update', body);
+    const d = await client.get(`/api/core/dataset/detail?id=${datasetId}`);
+    out({ ok: true, datasetId, name: d.name, type: d.type,
+          apiDatasetServer: d.apiDatasetServer, autoSync: d.autoSync });
+  },
+
+  /** 只读：看第三方知识库当前绑的是什么服务端 */
+  async 'ds api-info'(args, f) {
+    const datasetId = f.datasetId || args[0];
+    if (!datasetId) fail('用法: ds api-info <datasetId>');
+    const d = await client.get(`/api/core/dataset/detail?id=${datasetId}`);
+    const kinds = Object.keys(d.apiDatasetServer || {});
+    out({ ok: true, datasetId, name: d.name, type: d.type,
+          kinds, apiDatasetServer: d.apiDatasetServer || null, autoSync: d.autoSync });
+  },
+
+  /** 浏览第三方知识库的文件树（远端实时） */
+  async 'ds api-files'(args, f) {
+    const datasetId = f.datasetId || args[0];
+    if (!datasetId) fail('用法: ds api-files <datasetId> [--search 词] [--parent-id 远端目录ID]');
+    const files = await client.post('/api/core/dataset/apiDataset/list', {
+      datasetId, searchKey: f.search || '', parentId: f['parent-id'] || undefined
+    });
+    out({ ok: true, total: Array.isArray(files) ? files.length : 0, files: files || [] });
+  },
+
+  /** 把远端单个文件导入成集合（走 apiCollection，服务端会拉远端内容再切分训练） */
+  async 'ds api-import'(args, f) {
+    const datasetId = f.datasetId || args[0];
+    const apiFileId = f['file-id'] || args[1];
+    if (!datasetId || !apiFileId) fail('用法: ds api-import <datasetId> --file-id <远端文件ID> [--name 集合名] [--parent-id 本地目录]');
+    const d = await client.post('/api/core/dataset/collection/create/apiCollection', {
+      datasetId, parentId: f['parent-id'] || null,
+      name: f.name || apiFileId, apiFileId
+    });
+    // 服务端返回的是 V2 计数结构 { successCount, failedCount }，不直接给 collectionId
+    out({ ok: true, imported: d?.successCount ?? 1, skippedOrFailed: d?.failedCount ?? 0,
+          _notice: '已导入，训练异步执行；用 ds collections 拿 collectionId 后轮询 ds training' });
+  },
+
+  /** 递归同步远端目录（apiCollectionV2 批量导入，含子目录） */
+  async 'ds api-sync'(args, f) {
+    const datasetId = f.datasetId || args[0];
+    if (!datasetId) fail('用法: ds api-sync <datasetId> [--parent-id 远端目录ID] [--depth 3]');
+    const depth = Number(f.depth) || 3;
+    const collected = [];
+    async function walk(parentId, level) {
+      if (level > depth) return;
+      const list = await client.post('/api/core/dataset/apiDataset/list', {
+        datasetId, searchKey: '', parentId: parentId || undefined
+      });
+      for (const item of list || []) {
+        collected.push(item);
+        if (item.type === 'folder' || item.hasChild) await walk(item.rawId || item.id, level + 1);
+      }
+    }
+    await walk(f['parent-id'], 0);
+    if (!collected.length) {
+      out({ ok: true, successCount: 0, failedCount: 0, _notice: '远端目录为空，没有可导入的节点' });
+      return;
+    }
+    const r = await client.post('/api/core/dataset/collection/create/apiCollectionV2', {
+      datasetId, apiFiles: collected
+    });
+    out({ ok: true, scanned: collected.length, ...r });
   },
 
   /** 查自己对某个资源有什么权限（只读/读写/管理） */
@@ -2259,8 +2507,30 @@ const commands = {
 
   async 'ds detail'(args, f) {
     const id = f.id || args[0];
+    if (!id) fail('用法: ds detail <datasetId>');
     const d = await client.get(`/api/core/dataset/detail?id=${id}`);
-    out({ _id: d._id, name: d.name, type: d.type, vectorModel: d.vectorModel?.name, collectionCount: d.collectionCount });
+    out({
+      _id: d._id, name: d.name, type: d.type, intro: d.intro,
+      avatar: d.avatar, parentId: d.parentId ?? null,
+      vectorModel: d.vectorModel?.name, agentModel: d.agentModel?.name, vlmModel: d.vlmModel?.name,
+      collectionCount: d.collectionCount,
+      autoSync: d.autoSync ?? null,
+      websiteConfig: d.websiteConfig || null,
+      apiDatasetServer: d.apiDatasetServer || null,
+      chunkSettings: d.chunkSettings || null
+    });
+  },
+
+  /** 单集合同步：重拉远端/网页正文，内容变了就重建集合（第三方库和网页库都能用） */
+  async 'ds sync'(args, f) {
+    const collectionId = f.id || args[0];
+    if (!collectionId) fail('用法: ds sync <collectionId>   # 只同步这一个集合，不扫新增文件');
+    const r = await client.post('/api/core/dataset/collection/sync', { collectionId });
+    out({
+      ok: true, collectionId: r?.collectionId || collectionId,
+      changed: !!(r?.collectionId && r.collectionId !== collectionId),
+      _notice: '单集合同步只比对该集合正文；新增文件要走 ds api-sync（第三方库）或库级自动同步'
+    });
   },
 
   /** 上传本地文件创建文档。默认分块训练 + 全增强 */
@@ -2327,23 +2597,64 @@ const commands = {
     ));
   },
 
+  /** 图片集合：一次传多张图，图片自带向量索引（多模态知识库） */
+  async 'ds add-images'(args, f) {
+    const datasetId = f.datasetId || args[0];
+    const paths = (f.files ? String(f.files).split(',').map(s => s.trim()) : args.slice(1)).filter(Boolean);
+    if (!datasetId || !paths.length) fail('用法: ds add-images <datasetId> <图片1> [图片2 ...] [--name 集合名]');
+    for (const p of paths) if (!fs.existsSync(p)) fail(`文件不存在: ${p}`);
+    const d = await client.uploadMulti('/api/core/dataset/collection/create/images', {
+      fields: { data: JSON.stringify({
+        datasetId, parentId: f['parent-id'] || null,
+        collectionName: f.name || path.basename(paths[0]),
+        tags: undefined
+      }) },
+      files: paths.map(p => ({
+        name: path.basename(p),
+        buffer: fs.readFileSync(p),
+        contentType: /\\.png$/i.test(p) ? 'image/png' : /\\.(jpe?g)$/i.test(p) ? 'image/jpeg' : 'application/octet-stream'
+      }))
+    });
+    out(withNotice({ ok: true, images: paths.length, collectionId: d?.collectionId || d }, Notice.trainingAsync(d?.collectionId)));
+  },
+
+  /**
+   * 导入 CSV / Excel 表格集合。
+   * mode=backup（默认）：完整备份表，表头 q/a/index/metadata
+   * mode=template：导入模板，表头结构相同
+   */
+  async 'ds add-backup'(args, f) {
+    const datasetId = f.datasetId || args[0];
+    const filePath = f.file || args[1];
+    if (!datasetId || !filePath) fail('用法: ds add-backup <datasetId> <file.csv|xlsx> [--mode backup|template] [--parent-id id]');
+    if (!fs.existsSync(filePath)) fail(`文件不存在: ${filePath}`);
+    const mode = (f.mode || 'backup').toLowerCase();
+    if (!['backup', 'template'].includes(mode)) fail('--mode 只能是 backup / template');
+    const d = await client.upload('/api/core/dataset/collection/create/' + mode, {
+      fields: { data: JSON.stringify({ datasetId, parentId: f['parent-id'] || null, tags: undefined }) },
+      file: { name: path.basename(filePath), buffer: fs.readFileSync(filePath) }
+    });
+    out(withNotice({ ok: true, mode, collectionId: d?.collectionId, inserted: d?.results?.insertLen }, Notice.trainingAsync(d?.collectionId)));
+  },
+
   /** 文档列表 */
   async 'ds collections'(args, f) {
     const datasetId = f.datasetId || args[0];
     if (!datasetId) fail('用法: ds collections <datasetId>');
     const d = await client.post('/api/core/dataset/collection/listV2', {
-      datasetId, parentId: f.parentId || null,
+      datasetId, parentId: f.parentId || f['parent-id'] || null,
       pageNum: Number(f.page) || 1, pageSize: Number(f.size) || 20,
       searchText: f.search || ''
     });
-    out({
-      total: d.total,
-      list: (d.list || []).map(c => ({
-        _id: c._id, name: c.name, type: c.type,
-        trainingType: c.trainingType, fileId: c.fileId,
-        createTime: c.createTime
-      }))
-    });
+    let list = (d.list || []).map(c => ({
+      _id: c._id, name: c.name, type: c.type,
+      parentId: c.parentId ?? null,
+      ...(c.apiFileId ? { apiFileId: c.apiFileId } : {}),
+      trainingType: c.trainingType, fileId: c.fileId,
+      createTime: c.createTime
+    }));
+    if (f.type) list = list.filter(c => c.type === f.type);
+    out({ total: d.total, count: list.length, list });
   },
 
   /** 训练状态 */
@@ -2807,7 +3118,45 @@ const commands = {
         tool: ['new --name <名字> [--params a,b,c] [--code body.js] [--deploy]  生成工具骨架（pluginInput→code→pluginOutput）'],
         agent: ['list', 'create --name --type', 'new --name <名字> --tools <appId,appId> [--prompt "@p.txt"] [--deploy]  从工具生成 agent'],
         ds: [
-          'permission <datasetId>                      查自己的读写/管理权限','list', 'create --name', 'detail <datasetId>', 'add-file <id> <file>', 'add-text <id> --name --text', 'add-link <id> <url>', 'add-batch <id> <路径...> [--ext pdf]', 'add-qa <id> --file qa.json', 'collections <id>', 'search <id> "查询词"', 'training <collectionId>', 'retrain <collectionId>', 'data <collectionId>', 'del <collectionId>', 'delete <datasetId>', 'perm <id> on|off'],
+          'list [--search 词]',
+          'detail <datasetId>                          完整配置（模型/分块/网站/第三方/autoSync）',
+          'create --name N [--type 类型] [--parent-id P] [--intro I] [--avatar A]',
+          '  └ 类型: folder | dataset(默认) | websiteDataset | apiDataset | feishu | yuque | dingtalk | externalFile',
+          '  └ 网站库: --website-url URL --website-selector CSS',
+          '  └ 第三方: --api-base URL --api-token T | --yuque-user U --yuque-token T',
+          '            --feishu-app-id A --feishu-secret S --feishu-folder F',
+          '            --dd-app-key K --dd-app-secret S --dd-user-id U  （给了就自动推 type）',
+          '  └ 模型: --vector-model-id / --agent-model-id / --vlm-model-id',
+          '  └ 分块: --chunk-size N --index-size N --chunk-splitter S --split-mode M --setting-mode M',
+          '            --training-type chunk|qa --auto-indexes on|off --image-index on|off',
+          '  └ 其它: --auto-sync on|off',
+          'update <datasetId> [--name --intro --avatar --agent-model-id --website-url ...]  同上参数',
+          'delete <datasetId>', 'perm <datasetId> on|off   # 开/关文档级权限',
+          'permission <datasetId>                     查自己的读写/管理权限',
+          '',
+          '— 集合（文档）—',
+          'collections <datasetId> [--parent-id 目录] [--type apiFile|folder] [--size N] [--search 词]',
+          'add-file <id> <file>                       单文件上传（pdf/docx/xlsx/md…）',
+          'add-batch <id> <路径...> [--ext pdf,md] [--concurrency 3]   批量递归上传',
+          'add-text <id> --name 标题 --text 内容',
+          'add-link <id> <url> [--selector CSS]       网页链接集合',
+          'add-images <id> <图1> [图2...] [--name N]   图片集合（多模态）',
+          'add-backup <id> <file.csv|xlsx> [--mode backup|template]   CSV/Excel 表格导入',
+          'add-qa <id> --file qa.json [--q --a]        QA 问答对',
+          'data <collectionId>                        看切分后的数据块',
+          'training <collectionId>                    训练进度（done=true 才可检索）',
+          'retrain <collectionId>                     重训（会生成新 collectionId）',
+          'sync <collectionId>                        单集合重拉正文（网页/第三方库）',
+          'del <collectionId>                         删集合',
+          'search <datasetId> "查询词"                 检索召回测试',
+          '',
+          '— 第三方知识库专用 —',
+          'api-info <datasetId>                        看绑的服务端',
+          'api-config <datasetId> [服务端参数] [--auto-sync on|off]',
+          'api-files <datasetId> [--search 词] [--parent-id 远端目录]',
+          'api-import <datasetId> --file-id 远端文件ID  导入单个远端文件',
+          'api-sync <datasetId> [--depth 3]            库级增量同步（新增/改名/移动/删除）',
+        ],
         perm: [
           'dataset <id> [--set tmbId:6]              查/设知识库协作者',
           'collection <id> [--set tmbId:6]           查/设集合协作者',
@@ -2828,7 +3177,11 @@ const commands = {
       notes: [
         '任何命令加 --help 看 flags / 输出判据 / 示例：fastgpt wf build --help',
         '`fastgpt start` 会根据当前环境告诉你下一步该敲哪一条',
-        'modelId 必须是 24 位 ObjectId，用 model list 只能看名字，真实 ID 从已有节点取'
+        'modelId 必须是 24 位 ObjectId，用 model list 只能看名字，真实 ID 从已有节点取',
+        '保存走 POST /api/core/app/version/publish?appId=，isPublish/false 是草稿',
+        'handle 由 edge() 自动生成，不要手写',
+        '第三方知识库（apiDataset）= FastGPT 只存索引，文件正文留在外部服务',
+        '  └ 自定义 API 服务需实现: POST /v1/file/list, GET /v1/file/detail, GET /v1/file/content, GET /v1/file/read，统一返回 {success,message,data}'
       ]
     });
   },

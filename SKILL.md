@@ -1015,3 +1015,137 @@ FASTGPT_APP_KEY  应用 API Key（chat run 用）
 ```
 
 凭证存于 `.fastgpt/cookies.json`，权限 600。
+
+---
+
+## 第三方知识库（apiDataset / API 知识库）
+
+`type=apiDataset` 与普通 `dataset` 是两套东西：
+
+| | dataset | apiDataset |
+|---|---|---|
+| 文件正文 | 存在 FastGPT | 留在外部服务，`/v1/file/content` 现拉 |
+| 建库参数 | `ds create --name` | 必须再绑服务端 |
+| 集合类型 | `file` / `virtual` | `apiFile`（带远端 `apiFileId`） |
+| 导入入口 | `add-file` 上传 | `api-import` / `api-sync` 按远端 ID 拉 |
+| 训练 | 异步，等 `done=true` | 同左，内容变化靠 `retrain` |
+
+### 四种服务端（互斥，只给一种）
+
+```bash
+# 自定义 API 服务
+fastgpt ds create --name "X" --type apiDataset --api-base https://kb.example.com --api-token TOKEN [--api-base-path /v2]
+
+# 语雀
+fastgpt ds create --name "X" --type apiDataset --yuque-user USER --yuque-token TOKEN [--yuque-base-path P]
+
+# 飞书
+fastgpt ds create --name "X" --type apiDataset --feishu-app-id A --feishu-secret S --feishu-folder F
+
+# 钉钉
+fastgpt ds create --name "X" --type apiDataset --dd-app-key K --dd-app-secret S --dd-user-id U \
+  [--dd-operator-id O] [--dd-workspace-id W] [--dd-root-node R]
+```
+
+### 全流程
+
+```bash
+DS=$(fastgpt ds create --name "API文件知识库" --type apiDataset \
+      --api-base https://kb.example.com --api-token TOKEN | jq -r .datasetId)
+
+fastgpt ds api-info  "$DS"                      # 看绑了什么（authorization 服务端脱敏，返回空串属正常）
+fastgpt ds api-config "$DS" --auto-sync on      # 开/关自动同步，或换 baseUrl
+fastgpt ds api-files "$DS" --search 年报        # 远端文件树
+fastgpt ds api-import "$DS" --file-id doc_123   # 单个文件 → 集合
+fastgpt ds api-sync  "$DS" --depth 3            # 整个目录树递归导入（幂等，重复跑只补新增）
+```
+
+### 自定义 API 服务协议
+
+外部服务必须实现，统一响应 `{success:boolean, message:string, data:any}`，
+请求头 `Authorization: Bearer <api-token>`，超时 60s：
+
+| 方法 | 路径 | 入参 | `data` |
+|---|---|---|---|
+| POST | `/v1/file/list` | `{searchKey?, parentId?}` | `[{id, name, type:'file'\|'folder', parentId, hasChild, updateTime, createTime}]` |
+| GET | `/v1/file/detail` | `?id=` | `{id, name, type, parentId, hasChild, updateTime, createTime}` |
+| GET | `/v1/file/content` | `?id=` | `{title?, content}` 或 `{title?, previewUrl}`（二选一） |
+| GET | `/v1/file/read` | `?id=` | `{url}` |
+
+骨架实现：`examples/api-dataset-server.mjs`
+
+```bash
+KB_DIR=./docs KB_TOKEN=TOKEN PORT=18080 node examples/api-dataset-server.mjs
+cloudflared tunnel --url http://127.0.0.1:18080
+```
+
+### 五个必踩的坑
+
+1. **SaaS 版填 `127.0.0.1` 一定连不上** —— 那是 FastGPT 服务端的回环。要么私有化部署，要么隧道/公网域名。
+2. `apiCollection` 返回的是 `{successCount, failedCount}`，**没有 collectionId**，要 `ds collections` 反查。
+3. 远端文件改名/内容变化不会自动生效：`api-sync` 只补新增，要更新跑 `ds retrain <collectionId>`。
+4. `api-info` 里 `authorization` 显示空串是脱敏，不是丢了；`api-config` 不传 `--api-token` 不会清空已有 token。
+5. 报 `Can not find api dataset server` = 库建好了但没绑服务端，或绑的服务端字段不合法（四种只能选一种）。
+
+---
+
+## 知识库类型全表（ds create --type）
+
+| type | 说明 | 必填参数 | avatar |
+|---|---|---|---|
+| `dataset` | 普通库（默认） | — | commonDatasetColor |
+| `folder` | 文件夹，只归类 | — | folderColor |
+| `websiteDataset` | 网站同步库 | `--website-url` `--website-selector` | websiteDatasetColor |
+| `apiDataset` | 第三方 API 库 | `--api-base --api-token` | externalDatasetColor |
+| `feishu` | 飞书知识库 | `--feishu-app-id --feishu-secret --feishu-folder` | feishuDatasetColor |
+| `yuque` | 语雀知识库 | `--yuque-user --yuque-token` | yuqueDatasetColor |
+| `dingtalk` | 钉钉知识库 | `--dd-app-key --dd-app-secret --dd-user-id` | dingtalkDatasetColor |
+| `externalFile` | 外部文件库（旧） | — | externalDatasetColor |
+
+给了第三方服务端参数时 `--type` 可省略，CLI 自动推导（apiServer→apiDataset，yuqueServer→yuque …）。
+
+`POST /core/dataset/create` 不收 `websiteConfig` / `chunkSettings`，CLI 建完会补一次 `POST /core/dataset/update`。
+
+## 分块参数（容易踩坑）
+
+服务端 `computedCollectionChunkSettings()` 里：
+
+```js
+if (chunkSettingMode === 'auto') {   // 默认就是这个
+  chunkSplitMode = 'paragraph';
+  chunkSize = 1000;                  // 强制覆盖
+  indexSize = 512;                   // 强制覆盖
+  chunkSplitter = undefined;
+}
+```
+
+**只传 `--chunk-size` 不传 `--setting-mode` → 参数被静默丢弃。** CLI 已自动补 `custom`。
+
+`qaPrompt` 只在 `trainingType=qa` 时保留，其它模式会被 `delete`。
+
+## 集合类型与对应接口
+
+| 集合 | 命令 | 接口 |
+|---|---|---|
+| 本地文件 | `ds add-file` / `add-batch` | `POST collection/create/localFile`（multipart） |
+| 纯文本 | `ds add-text` | `POST collection/create/text` |
+| 网页链接 | `ds add-link` | `POST collection/create/link` |
+| 图片集 | `ds add-images` | `POST collection/create/images`（多文件 multipart） |
+| CSV/Excel | `ds add-backup` | `POST collection/create/backup` / `template` |
+| QA 对 | `ds add-qa` | `POST collection/data/pushData` 逐条 |
+| 第三方文件 | `ds api-import` / `api-sync` | `POST collection/create/apiCollection[/V2]` |
+
+## 单集合同步 vs 库级同步
+
+```
+ds sync <collectionId>   → POST /core/dataset/collection/sync
+                           只重拉这一个集合的正文，不扫新增文件
+
+ds api-sync <datasetId>  → 拉完整远端树 + syncPlan 差量
+                           新增/改名/移动/删除全覆盖
+
+自动同步                 → BullMQ 每日 scheduler，repeatDuration = 24h
+                           autoSync=true 才生效，首次在开启后 24 小时
+```
+
+排查“新文件没进来”的顺序：① 远端 `ds api-files` 能不能看到 ② 服务端 `/v1/file/list` 有没有按扩展名过滤 ③ 二进制文件 MIME 对不对（错 MIME → 集合建了但 `errors.parse=1`、数据块 0 条）。
