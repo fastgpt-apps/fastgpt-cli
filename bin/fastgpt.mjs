@@ -1086,6 +1086,18 @@ const commands = {
     const blockers = checks.filter(c => !c.ok && c.fix);
     const canWork = !!me && modelIds.length > 0;
 
+    if (f.brief) {
+      // 只报结论与阻塞项，省掉通过的明细
+      const lines = [
+        `ready=${canWork}${blockers.length ? ' blockers=' + blockers.length : ''}`,
+        canWork ? '环境就绪，可以建工作流（fastgpt wf build）' : '还不能建工作流',
+        ...blockers.map(c => `  ✗ ${c.check}: ${c.detail}  → ${c.fix}`),
+      ];
+      process.stdout.write(lines.join('\n') + '\n');
+      process.exitCode = blockers.length ? 1 : 0;
+      return;
+    }
+
     out({
       ok: blockers.length === 0,
       ready: canWork,
@@ -1096,6 +1108,106 @@ const commands = {
       ...(blockers.length ? { next: blockers[0].fix } : {}),
       ...(!base ? { presets: Object.entries(BASE_PRESETS).map(([k, v]) => ({ preset: k, label: v.label, base: v.base })) } : {}),
       version: JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+    });
+  },
+
+  // ===== DSL schema：给 agent 用的能力清单，不用读源码 =====
+  async 'schema'(args, f) {
+    const only = args[0];
+    const NODE_SCHEMA = {
+      start: {
+        ctor: "start(id, { x?, y?, name?, withFiles? })",
+        fields: { withFiles: "boolean，true 时 start 节点声明文件输入（配合 readFiles 用）" },
+        example: { type: "start", id: "n_start", withFiles: false },
+        note: "所有工作流必须且只能有一个 start",
+      },
+      readFiles: {
+        ctor: "readFiles(id, { files, name?, x?, y? })",
+        fields: { files: "[nodeId, outputId] 引用，通常 REF('n_start','userFiles')" },
+        example: { type: "readFiles", id: "n_read", files: ["n_start", "userFiles"] },
+        note: "只解析文本类文件；docx/pdf 需 start.withFiles=true",
+      },
+      chat: {
+        ctor: "chat(id, { modelId, prompt?, question?, quoteQA?, history?, name?, x?, y?, responseText?, reasoning?, reasoningEffort? })",
+        fields: {
+          modelId: "24 位 ObjectId，用 fastgpt model id 提取，不是模型名",
+          prompt: "string 或 [nodeId, outputId] 引用",
+          question: "同上",
+          responseText: "boolean，是否让节点自身输出（有 answerNode 消费时会被构建期自动置 false）",
+          reasoning: "boolean，仅 reasoning 模型（如 deepseek-v4.1-flash）有意义",
+          reasoningEffort: "'minimal' | 'medium' | 'high'",
+        },
+        example: { type: "chat", id: "n_ai", modelId: "<24位ObjectId>", prompt: "你是助手", question: ["n_start", "userChatInput"] },
+        note: "★ 是否流式由 autoTuneNodeParams 决定：被某个 answerNode 引用→false（不流式）；无 answerNode 消费→true（token 级流式）",
+      },
+      answer: {
+        ctor: "answer(id, { content, name?, x?, y? })",
+        fields: { content: "string 或 [nodeId, outputId]；引用 chat 输出可让其非流式" },
+        example: { type: "answer", id: "n_answer", content: ["n_ai", "answerText"] },
+        note: "多个 answerNode 分属互斥分支时，校验器只告警不报错",
+      },
+      ifElse: {
+        ctor: "ifElse(id, { conditions, name?, x?, y? })",
+        fields: {
+          conditions: "ifElseList 数组，元素形如 { branchId, condition:'AND'|'OR', list:[{ variable:[nodeId, key], condition:'equalTo', value:'x', valueType:'input'|'reference' }] }",
+        },
+        example: {
+          type: "ifElse", id: "n_if",
+          conditions: [{ branchId: "parse", condition: "AND", list: [{ variable: ["VARIABLE_NODE_ID", "type"], condition: "equalTo", value: "parse", valueType: "input" }] }],
+        },
+        note: "★ ELSE 是内建兜底分支，不用声明，直接 edge(src,dst,'ELSE')；条件 value 必须是字符串（布尔写 \"true\"）",
+      },
+      classify: { ctor: "classify(id, { modelId, prompt?, question?, branches, name?, x?, y? })", fields: { branches: "分支数组" }, example: { type: "classify", id: "n_cls", modelId: "<id>", branches: [] }, note: "LLM 意图识别分流，与 ifElse（确定性条件）区分" },
+      datasetSearch: { ctor: "datasetSearch(id, { datasets, question, similarity?, limit?, name?, x?, y? })", fields: { datasets: "知识库 id 数组" }, example: { type: "datasetSearch", id: "n_ds", datasets: ["<dsId>"], question: ["n_start", "userChatInput"] } },
+      textConcat: { ctor: "textConcat(id, { texts, name?, x?, y? })", fields: { texts: "数组，元素为 string 或引用" }, example: { type: "textConcat", id: "n_tc", texts: ["前缀", ["n_ai", "answerText"]] } },
+      code: { ctor: "code(id, { code, language?, name?, inputs?, outputs?, x?, y? })", fields: { code: "函数体字符串", inputs: "动态输入项", outputs: "输出定义" }, example: { type: "code", id: "n_code", language: "js", code: "return { ok: true }" } },
+      http: { ctor: "http(id, { url, method?, headers?, params?, jsonBody?, formBody?, contentType?, timeout?, name?, x?, y? })", fields: { headers: "字段名是 system_httpHeader（单数）" }, example: { type: "http", id: "n_http", url: "https://example.com", method: "GET" }, note: "body 里变量引用用 {{$nodeId.outputId$}}" },
+      pluginInput: { ctor: "pluginInput(id, { params, name?, x?, y? })", fields: { params: "参数定义数组" }, example: { type: "pluginInput", id: "n_in", params: ["a", "b"] } },
+      pluginOutput: { ctor: "pluginOutput(id, { from, name?, x?, y? })", fields: { from: "[nodeId, outputId]" }, example: { type: "pluginOutput", id: "n_out", from: ["n_ai", "answerText"] } },
+      raw: { ctor: "raw(id, { node })", fields: { node: "完整原生节点对象，逃生舱" }, example: { type: "raw", id: "n_x", node: {} }, note: "CLI 没覆盖的节点类型用这个兜底" },
+    };
+
+    const pick = only ? { [only]: NODE_SCHEMA[only] } : NODE_SCHEMA;
+    if (only && !NODE_SCHEMA[only]) {
+      fail(`未知节点类型 ${only}。可用：${Object.keys(NODE_SCHEMA).join(', ')}`);
+      return;
+    }
+
+    out({
+      ok: true,
+      dslVersion: '1.0',
+      file: {
+        required: ['nodes', 'edges'],
+        optional: ['appId', 'versionName', 'publish', 'chatConfig'],
+        appId: '不填则新建应用；填了则更新该应用',
+      },
+      nodes: {
+        path: 'nodes[]',
+        fields: { type: '节点类型', id: '节点唯一 id，连线与变量引用都用它', modelId: 'chat/classify/agent 必填，24 位 ObjectId' },
+        note: '其余字段按 type 各自定义，见 nodeTypes',
+      },
+      edges: {
+        path: 'edges[]',
+        format: '[source, target] 或 [source, target, branchKey]',
+        branchKey: '仅 ifElse/classify 的分支出口需要；内建兜底分支写 "ELSE"',
+        example: [['n_start', 'n_ai'], ['n_if', 'n_read', 'parse'], ['n_if', 'n_err', 'ELSE']],
+      },
+      variables: {
+        path: 'chatConfig.variables[]',
+        fields: { key: '变量名', label: '显示名', type: 'string | number | boolean' },
+        usage: '在 prompt/question 里引用写 ["VARIABLE_NODE_ID", "<key>"]',
+        example: [{ key: 'type', label: '任务类型', type: 'string' }],
+      },
+      nodeTypes: pick,
+      tips: [
+        '离线自检：fastgpt wf lint <file>（不需要登录）',
+        '验证再发布：fastgpt wf verify <file>（影子应用跑完即删）',
+        'modelId 用 fastgpt model id 提取，不要手写模型名',
+        'CLI 没覆盖的节点用 { type: "raw", id, node: <原生对象> }',
+        '裸调 API 时的必需 header：Cookie: fastgpt_token=<token>、appId: <appId>、fastgpt-web-request: fastgpt',
+        '  ↑ 缺 fastgpt-web-request 会 401，即使 token 有效',
+        '精简输出：app list --brief（每行 id<TAB>name<TAB>type）、doctor --brief（只报结论与阻塞项）',
+      ],
     });
   },
 
@@ -1202,7 +1314,13 @@ const commands = {
   // ===== 应用 =====
   async 'app list'(args, f) {
     const d = await client.post('/api/core/app/listV2', { parentId: null, searchKey: f.search || '', type: f.type || undefined });
-    out((d.list || d).map?.(x => ({ _id: x._id, name: x.name, type: x.type })) || d);
+    const list = (d.list || d).map?.(x => ({ _id: x._id, name: x.name, type: x.type })) || d;
+    if (f.brief) {
+      // 紧凑：每行 id<TAB>name<TAB>type，省 60%+ 输出体积
+      process.stdout.write(list.map(x => `${x._id}\t${x.name}\t${x.type}`).join('\n') + '\n');
+      return;
+    }
+    out(list);
   },
 
   async 'app create'(args, f) {
@@ -2648,6 +2766,7 @@ const commands = {
         init: ['首次使用运行：fastgpt init（配置地址 + 登录）'],
         start: ['根据当前环境与目录状态，告诉你下一步该敲哪一条命令'],
         doctor: ['环境自检：检查地址/登录/模型/知识库是否就绪'],
+        schema: ['输出 DSL 能力清单：节点类型 / 必填字段 / 最小示例（给 agent 用，不用读源码）', 'schema ifElse  只看某一节点'],
         info: ['环境快照（人类可读）：用户/团队/配额/资源/能力', 'info --deep  含工作流与知识库明细', 'info --json  输出结构化数据（给 agent）'],
         auth: ['login [--user --pass]（无参数进入交互引导）', 'scan [--no-wait]（打开浏览器扫码）', 'scan --wait --session-id <id>（第二轮确认）', 'whoami', 'logout'],
         model: ['list [--type llm]', 'id  （从已有应用提取 modelId）'],
