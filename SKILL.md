@@ -52,6 +52,61 @@ description: "管理 FastGPT 的唯一推荐方式。工作流必须用本 CLI �
 
 发布前必须 `wf check-run` 再看一遍，因为**服务端兼容裸写法**，功能正常不代表界面正常。
 
+### 🚨 红线四：code 节点的 outputs 是服务端硬枚举
+
+`outputs[]` 元素的 `type` / `valueType` 由服务端 zod 严格枚举，写错直接 400 `Data validation error`。
+0.3.0 起 `wf lint` 也会拦这类错（以前只查 return 字段，等于给假通行证）。
+
+| 字段 | 必填 | 取值 |
+|---|---|---|
+| `id` | ✅ | 输出 ID，下游引用靠它 |
+| `key` | ✅ | 输出键名，建议与 `id` 同值 |
+| `type` | ✅ | `static`（**自定义输出固定用这个**）/ `error` / `hidden` / `source` / `dynamic` |
+| `valueType` | 可选 | `string` `number` `boolean` `object` `arrayString` `arrayNumber` `arrayBoolean` `arrayObject` `arrayAny` `any` `chatHistory` `datasetQuote` `dynamic` |
+
+```json
+"outputs": [
+  { "id": "ok",   "key": "ok",   "type": "static", "label": "是否成功", "valueType": "boolean" },
+  { "id": "text", "key": "text", "type": "static", "label": "文本",     "valueType": "string"  }
+]
+```
+
+不声明 outputs 时默认给 `system_rawResponse`(object) + `system_error_text`(string)。
+完整契约随时可查：`fastgpt schema code` 的 `outputsContract` 字段（含两份枚举）。
+
+**注意 `type` 不是数据类型**：写 `"type": "boolean"` 是错的（那是 `valueType` 的值），
+必须先 `"type": "static"`。这是踩得最多的一条。
+
+### 服务端 zod 报错怎么定位
+
+`Data validation error` 不再是一句裸字符串 —— 0.3.0 起 `details.invalidFields[]` 直接给 `path`：
+
+```json
+{
+  "message": "error Data validation error",
+  "hint": "服务端 zod 校验失败，按 details.invalidFields[].path 直接定位写错的字段",
+  "details": {
+    "invalidFields": [
+      { "path": "nodes.3.outputs.0.type", "message": "Invalid input: expected static", "expected": "static" }
+    ]
+  }
+}
+```
+
+按 `path` 改对应字段即可，**不要再用「逐节点删除二分法」。**
+
+### chat run 带文件：只收公网 URL
+
+OpenAPI 官方明说「目前不支持上传文件」，所以 `chat run --file` 只接受公网链接：
+
+```bash
+fastgpt chat run <appId> -q "总结这份合同" --file https://oss.example.com/a.pdf
+fastgpt chat run <appId> -q "图里是什么" --file https://oss.example.com/a.png   # 自动走 image_url
+```
+
+传本地路径会被 `file_url_required` 拦住。两条替代路径：先传到 OSS 拿 URL，
+或用 `ds add-file` 把文档建进知识库、由工作流的 datasetSearch 节点检索。
+
 ### ✅ 画布校验已内置（0.2.1 起，不需要再手动 `--ui-cmd`）
 
 `wf build` 与 `wf verify` 在部署完成后会**自动起一个隔离的 headless Chrome**，

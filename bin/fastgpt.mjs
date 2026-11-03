@@ -165,6 +165,40 @@ const COMMAND_DOC = {
       'fastgpt ds tag batch 6ae94... --ids 6ae94ee,6ae94ef --mode remove --tag 保密等级'
     ]
   },
+  schema: {
+    usage: 'fastgpt schema [节点类型]',
+    about: '输出 DSL 能力清单。无参数：全量（含 file/edges/variables 契约）；给了节点类型：只吐该节点规格。',
+    flags: {},
+    output: 'nodeType / ctor / fields / example / note（code 额外带 outputsContract）',
+    examples: ['fastgpt schema', 'fastgpt schema ifElse', 'fastgpt schema code']
+  },
+  'app create': {
+    usage: 'fastgpt app create --name <名字> [--type advanced|simple|plugin|folder] [--folder <folderAppId>]',
+    about: '创建应用或文件夹。--folder / --parent-id 把应用直接建到文件夹里（服务端要求父级必须是 folder 类型）。',
+    flags: {
+      '--type': 'advanced（默认）/ simple / plugin / folder',
+      '--folder / --parent-id': '归入指定文件夹（先 app create --name 文件夹 --type folder 拿到 ID）',
+      '--avatar / --intro': '图标与简介'
+    },
+    output: 'ok / appId / type / parentId?；folder 返回 folder_created 提示，不返回「无法对话」',
+    examples: [
+      'fastgpt app create --name 中车 --type folder',
+      'fastgpt app create --name 通用文档服务 --folder 6ae99...'
+    ]
+  },
+  'chat run': {
+    usage: 'fastgpt chat run <appId> -q "问题" [--file <公网URL,...>] [--detail] [--key <apikey>]',
+    about: '跑一次对话（SSE 流式）。带 --file 时 content 变数组，图片走 image_url、其它走 file_url。',
+    flags: {
+      '--file': '公网可访问的文件链接，多个用逗号分隔。本地路径会被拒绝（OpenAPI 不支持上传）',
+      '--detail': '返回节点轨迹'
+    },
+    output: 'ok / trace[] / answer / _notice',
+    examples: [
+      'fastgpt chat run 6ae0... -q "总结一下这份合同" --file https://oss.example.com/a.pdf',
+      'fastgpt chat run 6ae0... -q "图里是什么" --file https://oss.example.com/a.png'
+    ]
+  },
   clean: {
     usage: 'fastgpt clean [--confirm]',
     about: '清理验证过程留下的空应用/影子应用（cli-verify-*、cli-probe-* 等）。',
@@ -1372,18 +1406,58 @@ const commands = {
       classify: { ctor: "classify(id, { modelId, prompt?, question?, branches, name?, x?, y? })", fields: { branches: "分支数组" }, example: { type: "classify", id: "n_cls", modelId: "<id>", branches: [] }, note: "LLM 意图识别分流，与 ifElse（确定性条件）区分" },
       datasetSearch: { ctor: "datasetSearch(id, { datasets, question, similarity?, limit?, name?, x?, y? })", fields: { datasets: "知识库 id 数组" }, example: { type: "datasetSearch", id: "n_ds", datasets: ["<dsId>"], question: ["n_start", "userChatInput"] } },
       textConcat: { ctor: "textConcat(id, { texts, name?, x?, y? })", fields: { texts: "数组，元素为 string 或引用" }, example: { type: "textConcat", id: "n_tc", texts: ["前缀", ["n_ai", "answerText"]] } },
-      code: { ctor: "code(id, { code, language?, name?, inputs?, outputs?, x?, y? })", fields: { code: "函数体字符串", inputs: "动态输入项", outputs: "输出定义" }, example: { type: "code", id: "n_code", language: "js", code: "return { ok: true }" } },
+      code: {
+        ctor: "code(id, { code, language?, name?, inputs?, outputs?, x?, y? })",
+        fields: {
+          code: "函数体字符串，形如 async function main({ a }) { return { x } }",
+          inputs: "动态输入项数组，元素 { key, label?, value: [nodeId, outputId], valueType?, required? }。只能引用，不能写常量（除非用 wf lint --inline-consts 内联）",
+          outputs: "输出定义数组，元素 { id, key, type, valueType?, label?, description? }。省略则默认 system_rawResponse(object) + system_error_text(string)"
+        },
+        outputsContract: {
+          required: ['id', 'key', 'type'],
+          type: { enum: ['static', 'error', 'hidden', 'source', 'dynamic'], note: '自定义输出固定用 static' },
+          valueType: {
+            enum: ['string', 'number', 'boolean', 'object', 'arrayString', 'arrayNumber', 'arrayBoolean', 'arrayObject', 'arrayAny', 'any', 'chatHistory', 'datasetQuote', 'dynamic'],
+            note: '不填则服务端按 any 处理，但下游引用会失去类型提示'
+          },
+          optional: ['label', 'description', 'valueDesc', 'defaultValue', 'required'],
+          warning: 'type / valueType 写了枚举外的值 → 服务端直接 400 "Data validation error"。id 与 key 都要给且建议同值'
+        },
+        example: {
+          type: "code", id: "n_code", language: "js",
+          code: "async function main({ raw }) { return { ok: true, text: String(raw) } }",
+          outputs: [
+            { id: 'ok', key: 'ok', type: 'static', label: '是否成功', valueType: 'boolean' },
+            { id: 'text', key: 'text', type: 'static', label: '文本', valueType: 'string' }
+          ]
+        },
+        note: "code 必须 return 一个对象；返回的 key 才能被下游引用。输出没声明就在 return 里给 → 下游选不到"
+      },
       http: { ctor: "http(id, { url, method?, headers?, params?, jsonBody?, formBody?, contentType?, timeout?, name?, x?, y? })", fields: { headers: "字段名是 system_httpHeader（单数）" }, example: { type: "http", id: "n_http", url: "https://example.com", method: "GET" }, note: "body 里变量引用用 {{$nodeId.outputId$}}" },
       pluginInput: { ctor: "pluginInput(id, { params, name?, x?, y? })", fields: { params: "参数定义数组" }, example: { type: "pluginInput", id: "n_in", params: ["a", "b"] } },
       pluginOutput: { ctor: "pluginOutput(id, { from, name?, x?, y? })", fields: { from: "[nodeId, outputId]" }, example: { type: "pluginOutput", id: "n_out", from: ["n_ai", "answerText"] } },
       raw: { ctor: "raw(id, { node })", fields: { node: "完整原生节点对象，逃生舱" }, example: { type: "raw", id: "n_x", node: {} }, note: "CLI 没覆盖的节点类型用这个兜底" },
     };
 
-    const pick = only ? { [only]: NODE_SCHEMA[only] } : NODE_SCHEMA;
-    if (only && !NODE_SCHEMA[only]) {
-      fail(`未知节点类型 ${only}。可用：${Object.keys(NODE_SCHEMA).join(', ')}`);
+    if (only) {
+      const spec = NODE_SCHEMA[only];
+      if (!spec) {
+        fail(`未知节点类型：${only}`, {
+          hint: 'schema 只接受【节点类型】（start/chat/code/ifElse/…），不接受命令名。看全部节点：fastgpt schema',
+          options: Object.keys(NODE_SCHEMA),
+          nextCommand: 'fastgpt schema'
+        });
+        return;
+      }
+      // 指定节点时只吐这一个节点的规格，不再附整份 DSL 骨架（否则和全量输出长得一样，看不出区别）
+      out({
+        ok: true, dslVersion: '1.0', nodeType: only, ...spec,
+        tips: ['看全部节点类型：fastgpt schema', `要连线/变量写法：fastgpt schema（无参，含 file/edges/variables 契约）`]
+      });
       return;
     }
+
+    const pick = NODE_SCHEMA;
 
     out({
       ok: true,
@@ -1546,12 +1620,21 @@ const commands = {
   async 'app create'(args, f) {
     const { name, type = 'advanced' } = f;
     if (!name) fail('需要 --name');
+    // 归入文件夹：--parent-id <folderAppId> 或 --folder <folderAppId>（服务端要求父级必须是 folder 类型）
+    const parentId = f.parentId || f['parent-id'] || f.folder || null;
     const appId = await client.post('/api/core/app/create', {
-      name, type, avatar: f.avatar || 'core/app/type/workflowFill', intro: f.intro || ''
+      name, type, parentId,
+      avatar: f.avatar || 'core/app/type/workflowFill', intro: f.intro || ''
     });
+    // 文件夹不是应用：不包含节点、不能对话、不能发布，提示不能复用 appCreated
+    const types = new Set(['advanced', 'simple', 'workflow', 'plugin', 'toolSet']);
     out(withNotice(
-      { ok: true, appId },
-      type === 'plugin' ? Notice.pluginPublished(appId) : Notice.appCreated(appId)
+      { ok: true, appId, type, ...(parentId ? { parentId } : {}) },
+      type === 'folder'
+        ? Notice.folderCreated(appId)
+        : type === 'plugin'
+          ? Notice.pluginPublished(appId)
+          : types.has(type) ? Notice.appCreated(appId) : null
     ));
   },
 
@@ -2417,8 +2500,12 @@ const commands = {
 
     const slim = {
       ok: r.ok, appId, httpStatus: r.httpStatus, Status: r.Status, DataSetDate: r.DataSetDate,
+      // contentLength / outputIsJson 默认就吐：它们是判断「跑通了没」的最小信号。
+      // 以前只在 --verbose 下输出，字段缺失会被 agent 读成 None，误判为丢数据。
+      contentLength: r.contentLength,
+      outputIsJson: r.outputIsJson,
       domains: r.domains, unresolvedVariables: r.unresolvedVariables,
-      ...(f.verbose ? { trace: r.trace, contentLength: r.contentLength } : {})
+      ...(f.verbose ? { trace: r.trace } : {})
     };
     out(withNotice(slim, r.ok ? null : {
       type: 'unresolved_variable',
@@ -3252,13 +3339,35 @@ const commands = {
     const appId = f.appId || args[0];
     const q = f.q || f.question;
     if (!appId || !q) fail('需要 --appId 和 -q "问题"');
+
+    // --file：OpenAPI 不接受文件上传，只收公网 URL（官方文档：「目前不支持上传文件」）。
+    // content 可以是数组，元素分文本 / 图片 / 文件三类。
+    const urls = String(f.file || f.files || '').split(',').map(s => s.trim()).filter(Boolean);
+    const notUrl = urls.filter(u => !/^https?:\/\//i.test(u));
+    if (notUrl.length) {
+      fail(`--file 只接受公网可访问的 URL，收到本地路径：${notUrl.join(', ')}`, {
+        subtype: 'file_url_required',
+        hint: 'OpenAPI 不支持直接上传文件。先把文件传到 OSS/对象存储拿 URL；如果是想让工作流解析文档，也可以先 ds add-file 建进知识库',
+        nextCommand: `fastgpt ds add-file <datasetId> ${notUrl[0]}`
+      });
+    }
+    const IMG_EXT = /\.(png|jpe?g|gif|webp|bmp)(\?|#|$)/i;
+    const content = urls.length
+      ? [
+          { type: 'text', text: q },
+          ...urls.map(url => IMG_EXT.test(url)
+            ? { type: 'image_url', image_url: { url } }
+            : { type: 'file_url', name: decodeURIComponent(url.split('?')[0].split('/').pop() || 'file'), url })
+        ]
+      : q;
+
     const key = f.key || process.env.FASTGPT_APP_KEY || fs.readFileSync('.fastgpt/apikey', 'utf8').trim();
     const res = await fetch(`${client.base}/api/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
       body: JSON.stringify({
         appId, chatId: f.chatId || `cli-${Date.now()}`, stream: true, detail: !!f.detail,
-        messages: [{ role: 'user', content: q }]
+        messages: [{ role: 'user', content }]
       })
     });
     if (!res.ok) {
@@ -3336,11 +3445,15 @@ const commands = {
         init: ['首次使用运行：fastgpt init（配置地址 + 登录）'],
         start: ['根据当前环境与目录状态，告诉你下一步该敲哪一条命令'],
         doctor: ['环境自检：检查地址/登录/模型/知识库是否就绪'],
-        schema: ['输出 DSL 能力清单：节点类型 / 必填字段 / 最小示例（给 agent 用，不用读源码）', 'schema ifElse  只看某一节点'],
+        schema: [
+          '输出 DSL 能力清单：节点类型 / 必填字段 / 最小示例（给 agent 用，不用读源码）',
+          'schema <节点类型>  只看该节点（如 schema code / schema ifElse）；不接受命令名、不接受 app.create',
+          '  └ code 节点还带 outputsContract：type / valueType 的完整枚举，写错会被 lint 和服务端双重拦'
+        ],
         info: ['环境快照（人类可读）：用户/团队/配额/资源/能力', 'info --deep  含工作流与知识库明细', 'info --json  输出结构化数据（给 agent）'],
         auth: ['login [--user --pass]（无参数进入交互引导）', 'scan [--no-wait]（打开浏览器扫码）', 'scan --wait --session-id <id>（第二轮确认）', 'whoami', 'logout'],
         model: ['list [--type llm]', 'id  （从已有应用提取 modelId）'],
-        app: ['list', 'create --name --type', 'detail <appId>', 'share create --appId --name --type share|iframe|apikey', 'share list --appId', 'share delete <_id>'],
+        app: ['list', 'create --name --type [--folder <folderAppId>]', 'detail <appId>', 'share create --appId --name --type share|iframe|apikey', 'share list --appId', 'share delete <_id>'],
         wf: [
           'build <dsl.json|原生导出.json> [--dry-run]   需要登录；构建前自动规范化（含 canEdit 常量内联）',
           'lint <file> [--fix out.json] [--inline-consts]  离线：语法 + 渲染契约检查',
@@ -3418,7 +3531,10 @@ const commands = {
           'invite --forbid <linkId>                  禁用链接',
           '权限值: 1管理 2写 4读，相加。读写=6 只读=4 全权=7'
         ],
-        chat: ['run --appId -q "问题" [--detail]'],
+        chat: [
+          'run --appId -q "问题" [--file <公网URL,...>] [--detail]',
+          '  └ --file 只收公网链接（图片→image_url，其它→file_url）；OpenAPI 不支持直接上传文件'
+        ],
         apikey: ['create --name']
       },
       notes: [

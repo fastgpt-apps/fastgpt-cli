@@ -567,6 +567,61 @@ const chatConfig = {
   ok('selectedTools 边保持原样', toolEdge.sourceHandle === 'selectedTools' && toolEdge.targetHandle === 'selectedTools');
 }
 
+// ---------- code 节点 outputs 契约（0.3.1 新增：以前 lint 不查，等于给假通行证）----------
+section('code 节点 outputs 服务端枚举');
+
+{
+  const mk = (outputs) => ({
+    nodes: [
+      node.start('n_start'),
+      { ...node.code('n_code', { code: 'async function main({ raw }) { return { ok: true } }' }), outputs },
+      node.answer('n_ans', { content: 'x' })
+    ],
+    edges: [edge('n_start', 'n_code'), edge('n_code', 'n_ans')]
+  });
+
+  // 正确格式
+  const good = validateWorkflow(mk([
+    { id: 'ok', key: 'ok', type: 'static', valueType: 'boolean', label: '是否成功' }
+  ]));
+  ok('正确 outputs 通过校验', good.ok, JSON.stringify(good.errors));
+
+  // type 写成数据类型（踩坑第一名）
+  const badType = validateWorkflow(mk([{ id: 'ok', key: 'ok', type: 'boolean' }]));
+  ok('type 写成 boolean 被拦', !badType.ok && badType.errors.some(e => /type=.*不在服务端枚举内/.test(e)), JSON.stringify(badType.errors));
+
+  // valueType 无语
+  const badVal = validateWorkflow(mk([{ id: 'ok', key: 'ok', type: 'static', valueType: 'text' }]));
+  ok('valueType=text 被拦', !badVal.ok && badVal.errors.some(e => /valueType=.*不在服务端枚举内/.test(e)), JSON.stringify(badVal.errors));
+
+  // 缺 id
+  const noId = validateWorkflow(mk([{ key: 'ok', type: 'static' }]));
+  ok('outputs 缺 id 被拦', !noId.ok && noId.errors.some(e => /缺 id/.test(e)), JSON.stringify(noId.errors));
+}
+
+// ---------- 服务端 zod 错误必须透出 path（不再是一句裸字符串）----------
+section('zod 校验错误结构化');
+
+{
+  const err = cliError('api_error', { message: 'error Data validation error' });
+  err.zod = [{ path: ['nodes', 3, 'outputs', 0, 'type'], message: 'Invalid input', expected: 'static' }];
+  const env = err.toEnvelope();
+  ok('invalidFields 透出', Array.isArray(env.error.details?.invalidFields));
+  ok('path 拉平为点号', env.error.details?.invalidFields?.[0]?.path === 'nodes.3.outputs.0.type');
+  ok('hint 指向 invalidFields', /invalidFields/.test(env.error.hint || ''));
+}
+
+// ---------- 文件夹不应该拿到「无法对话」的提示 ----------
+section('folder 提示');
+
+{
+  const f = Notice.folderCreated('6ae9a77eb7fa89380f83c91f');
+  ok('folder 有专用 notice', f.type === 'folder_created');
+  ok('folder notice 不提对话失败', !/无法对话/.test(f.message));
+  const a = Notice.appCreated('6ae000000000000000000000');
+  ok('app notice 仍提示节点为空', a.type === 'app_created' && /无法对话/.test(a.message));
+}
+
 // ---------- 输出 ----------
 console.log(results.join('\n'));
 console.log(`\n${'─'.repeat(50)}`);
