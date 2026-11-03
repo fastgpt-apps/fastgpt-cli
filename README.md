@@ -15,7 +15,7 @@ code 节点里出现 `detectChartType` / 字段别名表 / 中文问法正则 �
 ## 安装
 
 ```bash
-npm install -g github:SNKK2/fastgpt-cli
+npm install -g github:fastgpt-apps/fastgpt-cli
 ```
 
 零依赖，需要 Node 18+。装完直接使用 `fastgpt` 命令，不需要进入任何目录。
@@ -59,15 +59,17 @@ fastgpt auth scan
 
 | 组 | 命令数 | 能力 |
 |---|---|---|
-| `init` / `doctor` / `info` | 5 | 配置、环境自检、能力快照 |
-| `auth` | 5 | 密码登录、扫码登录、状态、登出 |
+| `init` / `doctor` / `info` | 3 | 配置、环境自检、能力快照 |
+| `auth` | 4 | 密码登录、扫码登录、状态、登出 |
 | `model` | 2 | 提取真实 modelId、列出模型 |
-| `app` | 6 | 创建、列表、详情、更新、删除、复制 |
-| `wf` | 5 | `build` / `lint` / `get` / `validate` / `publish` |
-| `ds` | 16 | 知识库、集合、文档、QA、训练、检索、权限 |
-| `perm` | 4 | 成员、权限、协作者 |
+| `app` | 7 | 创建、列表、详情、更新、删除、复制 |
+| `wf` | 10 | `build` / `lint` / `verify` / `diff` / `check-run` / `versions` / `ruleset` / `get` / `validate` / `publish` |
+| `ds` | 30 | 知识库、集合、文档、QA、训练、检索、权限、集合标签 |
+| `perm` | 6 | 成员、权限、协作者 |
 | `chat` | 1 | 运行对话，支持 SSE 流式和节点轨迹 |
 | `apikey` | 1 | 创建 API Key |
+
+> 上表共 **70 条**命令（含 `start` / `schema` / `find` / `tool` / `agent` / `clean` 等单条组）。`fastgpt help <组>` 可逐层下钻到每条命令的参数。
 
 ```bash
 fastgpt help                    # 全部命令
@@ -319,6 +321,32 @@ fastgpt ds search   <datasetId> "怎么退款"
 ```
 
 > `ds sync` 只重拉**这一个集合**的正文。扫描新增文件是库级的活（第三方库走 `ds api-sync`，否则等 24h 自动同步）。
+
+### 集合标签（商业版 v4.17.1+）
+
+给文档打多维度结构化标签（部门/分类/密级/生效日期），配合工作流的「知识库搜索」节点做检索前置过滤，先圈定范围再语义检索。
+
+```bash
+fastgpt ds tag list   <datasetId>                       # 列全部标签维度
+fastgpt ds tag create <datasetId> --tag 文档分类        # 建维度（默认 string）
+                        --type string|number|datetime|array
+
+# 打标：标签名自动解析成 tagId，打完回查确认
+fastgpt ds tag set <datasetId> <collectionId> --tag 文档分类 --value 合同审核
+fastgpt ds tag set <datasetId> <collectionId> --pairs "文档分类=合同审核,保密等级=内部"
+
+# 批量
+fastgpt ds tag batch <datasetId> --ids id1,id2 --tag 保密等级 --value 内部
+fastgpt ds tag batch <datasetId> --ids id1,id2 --mode remove --tag 保密等级
+fastgpt ds tag batch <datasetId> --ids id1,id2 --tag 适用部门 --value 法务,财务 --append
+
+# 按标签筛文档（当前页内过滤）
+fastgpt ds collections <datasetId> --tag 保密等级=内部
+```
+
+四种标签类型：`string`（自由文本）/ `number` / `datetime`（存 UTC 毫秒，`--value` 可写 `2026-01-01`）/ `array`（`--value a,b` 或 JSON 数组，配 `--append` 追加去重，默认覆盖）。
+
+`ds collections` 默认输出已含 `tags: [{ tag, value }]`。
 
 ### 第三方知识库（API 知识库）
 

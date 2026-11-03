@@ -122,6 +122,49 @@ const COMMAND_DOC = {
     output: 'next_command / why / context',
     examples: ['fastgpt start']
   },
+  'ds tag list': {
+    usage: 'fastgpt ds tag list <datasetId>',
+    about: '列出该知识库的全部标签维度（名称/类型/选项）。集合标签是商业版功能，需 v4.17.1+。',
+    flags: {},
+    output: 'count / list[{tagId,tag,tagType,options?}]',
+    examples: ['fastgpt ds tag list 6ae94eaceb11bfbe991a309b']
+  },
+  'ds tag create': {
+    usage: 'fastgpt ds tag create <datasetId> --tag <标签名> [--type string|number|datetime|array] [--force]',
+    about: '在库内建一个标签维度（相当于加一列）。同名已存在时直接返回已有维度，不报错。',
+    flags: {
+      '--type': 'string（默认，自由文本）/ number / datetime（存 UTC 毫秒）/ array（字符串数组）',
+      '--force': '同名也重新创建'
+    },
+    output: 'ok / tagId / tag / tagType / existed?',
+    examples: ['fastgpt ds tag create 6ae94... --tag 文档分类', 'fastgpt ds tag create 6ae94... --tag 保密等级 --type string']
+  },
+  'ds tag set': {
+    usage: 'fastgpt ds tag set <datasetId> <collectionId> --tag <标签名> --value <值> [--pairs "A=B,C=D"]',
+    about: '给单个文档打标签。标签名自动解析成 tagId；--pairs 可一次打多个维度。打完会回查确认。',
+    flags: {
+      '--tag / --value': '单个维度：标签名 + 值',
+      '--pairs': '多维度一次打："文档分类=合同审核,保密等级=内部"'
+    },
+    output: 'ok / applied[] / stored[] / verified',
+    examples: [
+      'fastgpt ds tag set 6ae94... 6ae94ee... --tag 文档分类 --value 合同审核',
+      'fastgpt ds tag set 6ae94... 6ae94ee... --pairs "文档分类=合同审核,保密等级=内部"'
+    ]
+  },
+  'ds tag batch': {
+    usage: 'fastgpt ds tag batch <datasetId> --ids <id1,id2> [--mode add|remove] --tag <标签名> [--value <值>] [--append]',
+    about: '批量打标或批量移除。add 必须给值；remove 不给值则移除整个标签，给值只移除该值。',
+    flags: {
+      '--mode': 'add（默认）/ remove',
+      '--append': '仅 array 类型 add 生效：追加到已有选项并去重（默认是覆盖）'
+    },
+    output: 'ok / mode / tag / count / collectionIds[]',
+    examples: [
+      'fastgpt ds tag batch 6ae94... --ids 6ae94ee,6ae94ef --tag 保密等级 --value 内部',
+      'fastgpt ds tag batch 6ae94... --ids 6ae94ee,6ae94ef --mode remove --tag 保密等级'
+    ]
+  },
   clean: {
     usage: 'fastgpt clean [--confirm]',
     about: '清理验证过程留下的空应用/影子应用（cli-verify-*、cli-probe-* 等）。',
@@ -590,6 +633,92 @@ function buildApiDatasetServer(f) {
 }
 
 const DATASET_TYPES = ['folder', 'dataset', 'websiteDataset', 'apiDataset', 'feishu', 'yuque', 'dingtalk', 'externalFile'];
+
+// ---------- 集合（文档）标签：FastGPT v4.17.1+ 商业版 ----------
+// 实测契约（cloud.fastgpt.cn，2026-11）：
+//   1. tag/create 成功返回【裸字符串 ID】，不是 { _id }；
+//   2. tag/batchSetCollectionTags 成功返回 null（无响应体），不能靠返回值判断成败，必须回查；
+//   3. 写入是 { tagId, value }（ID+值），listV2/detail 读出来是展平的 { tag, value }（标签名+值），两个方向格式不同。
+const COLLECTION_TAG_TYPES = ['string', 'number', 'datetime', 'array'];
+
+/** 拉该库全部标签维度（统一成 tagId/tag/tagType 三个字段，屏蔽 _id） */
+async function listCollectionTags(datasetId) {
+  let d;
+  try {
+    d = await client.get(`/api/proApi/core/dataset/tag/getAllTags?datasetId=${datasetId}`);
+  } catch (e) {
+    // 社区版没有 proApi 路由，返回 HTML 404 —— 这不是 bug，是版本能力问题，得说人话
+    if (e.code === 404 || /HTTP 404/.test(e.message || '')) {
+      failCli('collection_tag_unavailable', { nextCommand: 'fastgpt doctor' });
+    }
+    throw e;
+  }
+  return (d?.list || []).map(t => ({
+    tagId: t._id,
+    tag: t.tag,
+    tagType: t.tagType || 'string',
+    ...(t.options?.length ? { options: t.options } : {})
+  }));
+}
+
+/** 标签名或 tagId → 维度对象。用户习惯敲名字，接口只认 ID，这里做解析。 */
+async function resolveCollectionTag(datasetId, tagOrId) {
+  if (!tagOrId) fail('缺少 --tag（标签名或 tagId）');
+  const all = await listCollectionTags(datasetId);
+  const hit = all.find(t => t.tagId === tagOrId || t.tag === tagOrId);
+  if (!hit) {
+    fail(`标签不存在：${tagOrId}`, {
+      subtype: 'tag_not_found',
+      options: all.length ? all.map(t => `${t.tag}（${t.tagType}）`) : ['该库还没有任何标签'],
+      nextCommand: all.length
+        ? `fastgpt ds tag list ${datasetId}`
+        : `fastgpt ds tag create ${datasetId} --tag 文档分类`
+    });
+  }
+  return hit;
+}
+
+/** 原始字符串 → 对应 tagType 的值：datetime 转 UTC 毫秒，array 支持逗号分隔或 JSON 数组 */
+function coerceTagValue(tagType, raw) {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  switch (tagType) {
+    case 'number': {
+      const n = Number(raw);
+      if (!Number.isFinite(n)) fail(`--value 必须是数字，收到：${raw}`);
+      return n;
+    }
+    case 'datetime': {
+      const ms = /^\d+$/.test(String(raw)) ? Number(raw) : Date.parse(raw);
+      if (!Number.isFinite(ms)) fail(`--value 日期无法解析：${raw}（支持 2026-01-01 / ISO / 毫秒时间戳）`);
+      return ms;
+    }
+    case 'array': {
+      if (Array.isArray(raw)) return raw.map(String);
+      const s = String(raw).trim();
+      if (s.startsWith('[')) {
+        try {
+          const a = JSON.parse(s);
+          if (Array.isArray(a)) return a.map(String);
+        } catch {}
+      }
+      return s.split(',').map(x => x.trim()).filter(Boolean);
+    }
+    default:
+      return String(raw);
+  }
+}
+
+/** "文档分类=合同审核,保密等级=内部" → [[名, 值], ...] */
+function parseTagPairs(raw) {
+  return String(raw)
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => {
+      const i = s.indexOf('=');
+      return i < 0 ? [s, undefined] : [s.slice(0, i).trim(), s.slice(i + 1).trim()];
+    });
+}
 
 /** 第三方服务端 flag -> 对应的知识库 type（给了就不用手写 --type） */
 const SERVER_TYPE_MAP = {
@@ -2650,11 +2779,122 @@ const commands = {
       _id: c._id, name: c.name, type: c.type,
       parentId: c.parentId ?? null,
       ...(c.apiFileId ? { apiFileId: c.apiFileId } : {}),
+      ...(c.tags?.length ? { tags: c.tags } : {}),
       trainingType: c.trainingType, fileId: c.fileId,
       createTime: c.createTime
     }));
     if (f.type) list = list.filter(c => c.type === f.type);
-    out({ total: d.total, count: list.length, list });
+    // --tag 文档分类=合同审核[,保密等级=内部]：只写名字则匹配「有这个标签」
+    if (f.tag) {
+      const want = parseTagPairs(f.tag);
+      list = list.filter(c => want.every(w =>
+        (c.tags || []).some(t => t.tag === w[0] && (w[1] === undefined || String(t.value) === w[1]))
+      ));
+    }
+    out({
+      total: d.total, count: list.length, list,
+      ...(f.tag ? { filteredByTag: f.tag, note: '按标签筛选只作用于当前页（total 是整库总数）' } : {})
+    });
+  },
+
+  // ---------- 集合（文档）标签：商业版功能，v4.17.1+ ----------
+
+  /** 列该库所有标签维度 */
+  async 'ds tag list'(args, f) {
+    const datasetId = f.datasetId || f['dataset-id'] || args[0];
+    if (!datasetId) fail('用法: ds tag list <datasetId>');
+    const list = await listCollectionTags(datasetId);
+    out({
+      datasetId, count: list.length, list,
+      ...(list.length ? {} : { hint: `该库还没有标签，先建一个：fastgpt ds tag create ${datasetId} --tag 文档分类` })
+    });
+  },
+
+  /** 建标签维度（类似建一列） */
+  async 'ds tag create'(args, f) {
+    const datasetId = f.datasetId || f['dataset-id'] || args[0];
+    const tag = f.tag || f.name || args[1];
+    if (!datasetId || !tag) fail('用法: ds tag create <datasetId> --tag 标签名 [--type string|number|datetime|array]');
+    const tagType = String(f.type || 'string').toLowerCase();
+    if (!COLLECTION_TAG_TYPES.includes(tagType)) {
+      fail(`--type 只能是 ${COLLECTION_TAG_TYPES.join(' / ')}`, { options: COLLECTION_TAG_TYPES });
+    }
+    const existing = (await listCollectionTags(datasetId)).find(t => t.tag === tag);
+    if (existing && !f.force) {
+      out({ ok: true, existed: true, datasetId, ...existing, hint: '标签已存在，直接打值即可：ds tag set' });
+      return;
+    }
+    const r = await client.post('/api/proApi/core/dataset/tag/create', { datasetId, tag, tagType });
+    // 实测返回裸字符串 ID；兼容对象形态以防版本差异
+    const tagId = typeof r === 'string' ? r : (r?._id || r?.tagId || r?.id);
+    out({ ok: true, datasetId, tagId: tagId ?? null, tag, tagType });
+  },
+
+  /** 给单个集合（文档）打标签 */
+  async 'ds tag set'(args, f) {
+    const datasetId = f.datasetId || f['dataset-id'] || args[0];
+    const collectionId = f.id || f.collectionId || f['collection-id'] || args[1];
+    if (!datasetId || !collectionId) {
+      fail('用法: ds tag set <datasetId> <collectionId> --tag 标签名 --value 值\n' +
+        '   或: ds tag set <datasetId> <collectionId> --pairs "文档分类=合同审核,保密等级=内部"');
+    }
+    const pairs = f.pairs ? parseTagPairs(f.pairs) : [[f.tag || args[2], f.value]];
+    if (!pairs.length || !pairs[0][0]) fail('缺少 --tag 或 --pairs');
+
+    const tags = [];
+    const applied = [];
+    for (const [name, raw] of pairs) {
+      const t = await resolveCollectionTag(datasetId, name);
+      const value = coerceTagValue(t.tagType, raw);
+      if (value === undefined) fail(`标签「${t.tag}」缺少 --value（${t.tagType} 类型）`);
+      tags.push({ tagId: t.tagId, value });
+      applied.push({ tag: t.tag, tagType: t.tagType, value });
+    }
+
+    await client.post('/api/proApi/core/dataset/tag/batchSetCollectionTags', {
+      datasetId, collectionIds: [collectionId], mode: 'add', tags
+    });
+
+    // 接口成功返回 null，回查一次确认真的落库
+    const d = await client.get(`/api/core/dataset/collection/detail?id=${collectionId}`).catch(() => null);
+    const stored = (d?.collection || d)?.tags ?? null;
+    out({
+      ok: true, datasetId, collectionId,
+      applied,
+      stored,
+      verified: Array.isArray(stored) && applied.every(a => stored.some(s => s.tag === a.tag))
+    });
+  },
+
+  /** 批量打标 / 批量移除 */
+  async 'ds tag batch'(args, f) {
+    const datasetId = f.datasetId || f['dataset-id'] || args[0];
+    const ids = String(f.ids || f.id || args[1] || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!datasetId || !ids.length) {
+      fail('用法: ds tag batch <datasetId> --ids <id1,id2> [--mode add|remove] --tag 标签名 [--value 值] [--append]');
+    }
+    const mode = String(f.mode || 'add').toLowerCase();
+    if (!['add', 'remove'].includes(mode)) fail('--mode 只能是 add / remove', { options: ['add', 'remove'] });
+
+    const t = await resolveCollectionTag(datasetId, f.tag || args[2]);
+    const value = coerceTagValue(t.tagType, f.value);
+    if (mode === 'add' && value === undefined) fail(`add 模式必须给 --value（${t.tagType} 类型）`);
+    const append = !!f.append && t.tagType === 'array';
+
+    await client.post('/api/proApi/core/dataset/tag/batchSetCollectionTags', {
+      datasetId, collectionIds: ids, mode,
+      tags: [{ tagId: t.tagId, ...(value !== undefined ? { value } : {}), ...(append ? { append: true } : {}) }]
+    });
+
+    out({
+      ok: true, datasetId, mode, tag: t.tag, tagType: t.tagType,
+      ...(value !== undefined ? { value } : {}),
+      ...(append ? { append: true } : {}),
+      collectionIds: ids, count: ids.length,
+      note: mode === 'remove' && value === undefined
+        ? '已移除整个标签（该维度所有值）；给 --value 则只移除指定值'
+        : undefined
+    });
   },
 
   /** 训练状态 */
@@ -3149,6 +3389,13 @@ const commands = {
           'sync <collectionId>                        单集合重拉正文（网页/第三方库）',
           'del <collectionId>                         删集合',
           'search <datasetId> "查询词"                 检索召回测试',
+          '',
+          '— 集合（文档）标签（商业版 v4.17.1+）—',
+          'collections <datasetId> [--tag 文档分类=合同审核]   输出已含 tags 字段；--tag 按标签筛当前页',
+          'tag list <datasetId>                          列全部标签维度',
+          'tag create <datasetId> --tag 名 [--type string|number|datetime|array]',
+          'tag set <datasetId> <collectionId> --tag 名 --value 值   打标（或 --pairs "A=B,C=D"）',
+          'tag batch <datasetId> --ids a,b --mode add|remove --tag 名 [--value 值] [--append]',
           '',
           '— 第三方知识库专用 —',
           'api-info <datasetId>                        看绑的服务端',

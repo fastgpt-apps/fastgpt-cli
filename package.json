@@ -1,6 +1,6 @@
 {
   "name": "fastgpt-cli",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "命令行管理 FastGPT：工作流 DSL 构建、知识库文档与 QA 导入、权限配置、发布渠道、运行调试",
   "type": "module",
   "bin": {
@@ -27,6 +27,14 @@
     "agent"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fastgpt-apps/fastgpt-cli.git"
+  },
+  "homepage": "https://github.com/fastgpt-apps/fastgpt-cli#readme",
+  "bugs": {
+    "url": "https://github.com/fastgpt-apps/fastgpt-cli/issues"
+  },
   "scripts": {
     "test": "node tests/smoke.mjs",
     "test:validate": "node bin/fastgpt.mjs wf validate examples/dsl-contract-review.json",

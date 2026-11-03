@@ -186,7 +186,7 @@ DSL 里只需要 `type` + `id` + 业务参数，节点结构、连线 handle、s
 ## 安装与前置
 
 ```bash
-npm install -g github:SNKK2/fastgpt-cli
+npm install -g github:fastgpt-apps/fastgpt-cli
 
 fastgpt init      # 交互选择部署版本 + 登录
 fastgpt doctor    # 环境自检
@@ -328,6 +328,18 @@ fastgpt info --json     # 结构化，给 agent 解析
 | `chat run` 空回答 | `empty_answer` | 应用未发布或节点未配模型 |
 
 **看到 `_notice` 就按 `hint` 走下一步，不要忽略。**
+
+## 集合标签的 3 个接口陷阱（已固化在 `ds tag` 里）
+
+实测（cloud.fastgpt.cn）得到的三条反直觉契约，手写脚本时必踩：
+
+1. **`tag/create` 成功返回裸字符串 ID**（如 `"6ae995c3..."`），不是 `{ _id }`。按 `res._id` 取会拿到 `undefined`，下一步请求直接 400 `Invalid input: expected string, received undefined`。
+2. **`tag/batchSetCollectionTags` 成功返回 `null`**（无响应体）。不能靠返回值判成败，必须 `collection/detail` 回查 `tags`。CLI 的 `ds tag set` 已返回 `verified` 字段。
+3. **读写格式不对称**：写入要 `{ tagId, value }`（ID+值），读出来是 `{ tag, value }`（标签名+值）。CLI 已做双向映射，所以 `--tag` 可以直接写名字。
+
+另外：`/dataset/collection/tagFilterOptions` 在 SaaS 上是**页面路由**，请求会返回 HTML 404。要筛选项请自己从 `getAllTags` 算，别调它。
+
+社区版无 proApi 路由，会退化为 `collection_tag_unavailable`（提示先跑 `doctor`）。
 
 ## 工具调用（agent v2）
 
@@ -679,6 +691,15 @@ fastgpt ds search <datasetId> "查询词"            # 检索召回测试
 fastgpt ds retrain <collectionId>
 fastgpt ds del <collectionId>
 fastgpt ds perm <datasetId> on                   # 开启文档级权限
+
+# 集合标签（商业版 v4.17.1+）：多维度过滤检索范围
+fastgpt ds tag list <datasetId>                            # 现有标签维度
+fastgpt ds tag create <datasetId> --tag 文档分类           # 建维度（待选 --type string|number|datetime|array）
+fastgpt ds tag set <datasetId> <collectionId> --tag 文档分类 --value 合同审核
+fastgpt ds tag set <datasetId> <collectionId> --pairs "文档分类=合同审核,保密等级=内部"
+fastgpt ds tag batch <datasetId> --ids id1,id2 --tag 保密等级 --value 内部 [--append]
+fastgpt ds tag batch <datasetId> --ids id1,id2 --mode remove --tag 保密等级
+fastgpt ds collections <datasetId> --tag 保密等级=内部      # 按标签筛选（当前页内）
 
 # ============ 权限（permission: 1管理 2写 4读，相加）============
 # 读写=6  只读=4  全权=7  传 0 表示移除

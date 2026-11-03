@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>fastgpt-cli 0.2.0 — 架构 / 命令流程 / 数据链路</title>
+<title>fastgpt-cli 0.3.0 — 架构 / 命令流程 / 数据链路</title>
 <style>
   :root{
     --bg:#080d18; --panel:#111a2b; --panel2:#16213594; --line:#22304a;
@@ -117,22 +117,22 @@
 <div class="wrap">
 
   <div class="hero">
-    <h1>fastgpt-cli 0.2.0 · 架构 / 命令流程 / 数据链路</h1>
+    <h1>fastgpt-cli 0.3.0 · 架构 / 命令流程 / 数据链路</h1>
     <p class="sub">
       一个<strong>零依赖 Node CLI</strong>，用命令管理 FastGPT 全部资源：工作流 DSL 编译、知识库、权限、发布渠道、运行调试。
       设计目标不是「人好用」，而是<strong>agent 可无人值守调用</strong>：所有输出是 JSON、每条错误自带下一步、撞死路就停。
     </p>
     <div class="badges">
       <span class="badge">bin <b>fastgpt</b> · Node ≥18</span>
-      <span class="badge"><b>48</b> 命令 / 10 组</span>
-      <span class="badge"><b>8</b> 模块 · 4,589 行</span>
+      <span class="badge"><b>70</b> 命令 / 17 组</span>
+      <span class="badge"><b>8</b> 模块 · 6,470 行</span>
       <span class="badge"><b>140</b> 离线断言</span>
       <span class="badge">依赖 <b>0</b></span>
     </div>
     <div class="kpis">
-      <div class="kpi"><div class="v">1,975</div><div class="k">bin/fastgpt.mjs<br>命令分发 + handler</div></div>
+      <div class="kpi"><div class="v">3,521</div><div class="k">bin/fastgpt.mjs<br>命令分发 + handler</div></div>
       <div class="kpi"><div class="v">7</div><div class="k">lib 模块<br>client/auth/errors/…</div></div>
-      <div class="kpi"><div class="v">27</div><div class="k">错误 subtype 注册<br>8 个 category</div></div>
+      <div class="kpi"><div class="v">31</div><div class="k">错误 subtype 注册<br>8 个 category</div></div>
       <div class="kpi"><div class="v">16</div><div class="k">节点构造器<br>DSL → workflow</div></div>
       <div class="kpi"><div class="v">16</div><div class="k">校验 issue code<br>auto / manual 分流</div></div>
     </div>
@@ -454,7 +454,7 @@ fastgpt model id 成功
 
   <footer>
     <span>源码：<code>~/Dev/projects/fastgpt-cli</code>（v0.2.0，未 commit）</span>
-    <span>安装：<code>npm i -g github:SNKK2/fastgpt-cli</code></span>
+    <span>安装：<code>npm i -g github:fastgpt-apps/fastgpt-cli</code></span>
     <span>生成：2026-10-27</span>
   </footer>
 </div>
