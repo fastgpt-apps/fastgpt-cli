@@ -36,8 +36,16 @@
     "url": "https://github.com/fastgpt-apps/fastgpt-cli/issues"
   },
   "scripts": {
-    "test": "node tests/smoke.mjs",
+    "test": "node tests/smoke.mjs && node --test tests/import-tagged.test.mjs",
     "test:validate": "node bin/fastgpt.mjs wf validate examples/dsl-contract-review.json",
-    "test:all": "node tests/smoke.mjs && node bin/fastgpt.mjs wf validate examples/dsl-contract-review.json"
+    "test:all": "npm test && npm run test:validate"
+  },
+  "dependencies": {
+    "exceljs": "4.4.0"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
   }
 }

@@ -3,6 +3,7 @@
 // 通用约定：所有命令输出 JSON，错误以非零退出码返回
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { client, whoami, FastGPTError, isConfigured, saveConfig, getBase, CONFIG_PATH, HOME } from '../lib/client.mjs';
 import { cliError, exitCodeFor, isCliError, BASE_PRESETS, WEBSITE_TO_PRESET, Notice, withNotice } from '../lib/errors.mjs';
 import { setBlock, getBlock, clearBlock, blockEnvelope } from '../lib/blocker.mjs';
@@ -13,6 +14,7 @@ import { edge, validateWorkflow, normalizeWorkflow } from '../lib/validate.mjs';
 import { diffWorkflow } from '../lib/diff.mjs';
 import { checkCanvas } from '../lib/ui-check.mjs';
 import { compareRuleset, calibrateRuleset, DIAGNOSTIC_CODES } from '../lib/ruleset.mjs';
+import { readImportManifest, loadDatasetRoutes, prepareImportJobs, executeTaggedImport, normalizeImportPath, resolveDatasetId } from '../lib/import-tagged.mjs';
 
 const out = o => console.log(JSON.stringify(o, null, 2));
 
@@ -150,6 +152,27 @@ const COMMAND_DOC = {
     examples: [
       'fastgpt ds tag set 6ae94... 6ae94ee... --tag 文档分类 --value 合同审核',
       'fastgpt ds tag set 6ae94... 6ae94ee... --pairs "文档分类=合同审核,保密等级=内部"'
+    ]
+  },
+  'ds import-tagged': {
+    usage: 'fastgpt ds import-tagged <目录> --manifest <tags.xlsx|csv|json> [--routes routes.json] [--state state.json] [--dry-run] [--retry-uncertain <相对路径>]',
+    about: '按相对路径匹配标签表，递归目录文件分库上传、写入标签并回读核验；状态文件支持安全续跑。',
+    flags: {
+      '--manifest': '必填，Excel（xlsx/xlsm）、CSV 或 JSON；表格须包含 path 列和标签列，可选 datasetId 列',
+      '--routes': 'JSON 路由表，按目录名或相对目录路径匹配知识库 ID；manifest 行的 datasetId 优先',
+      '--path-column': '表格中的相对路径列名，默认 path',
+      '--dataset-column': '表格中的知识库 ID 列名，默认 datasetId；不使用时设为 none',
+      '--sheet': 'Excel 工作表名称或从 1 开始的序号，默认第一个工作表',
+      '--state': '续跑状态文件，默认 <目录>/.fastgpt-import-state.json；自定义路径必须放在资料目录外，请保留到任务完成',
+      '--dry-run': '只做本地路径、知识库路由与标签维度预检，不上传文件或写标签',
+      '--array-delimiter': 'array 标签的分隔符，默认分号；也可在单元格填写 JSON 数组',
+      '--retry-uncertain': '显式重试上传结果不确定的单个相对路径，先确认远端没有重复文档'
+    },
+    output: 'ok / dryRun / total / uploaded / tagged / failed / failures[] / statePath',
+    examples: [
+      'fastgpt ds import-tagged ./资料 --manifest ./标签.xlsx --routes ./routes.json --dry-run',
+      'fastgpt ds import-tagged ./资料 --manifest ./标签.xlsx --routes ./routes.json',
+      'fastgpt ds import-tagged ./资料 --manifest ./标签.xlsx --routes ./routes.json --retry-uncertain "2026/案例库/a.pdf"'
     ]
   },
   'ds tag batch': {
@@ -2999,6 +3022,90 @@ const commands = {
     out({ ok: okCount === files.length, total: files.length, success: okCount, failed: files.length - okCount, results });
   },
 
+  /** 按目录/清单映射一条龙导入文件并写入逐文档标签。 */
+  async 'ds import-tagged'(args, f) {
+    const rootPath = args[0];
+    const manifestPath = f.manifest;
+    if (!rootPath || !manifestPath) {
+      fail('用法: ds import-tagged <目录> --manifest <tags.xlsx|csv|json> [--routes routes.json] [--state state.json] [--dry-run]');
+    }
+    const root = path.resolve(rootPath);
+    const manifest = path.resolve(manifestPath);
+    const routesPath = f.routes ? path.resolve(f.routes) : null;
+    const routes = routesPath ? loadDatasetRoutes(routesPath) : {};
+    const pathColumn = f['path-column'] ? String(f['path-column']) : 'path';
+    const datasetColumn = String(f['dataset-column'] ?? 'datasetId').toLowerCase() === 'none' ? null
+      : (f['dataset-column'] ? String(f['dataset-column']) : 'datasetId');
+    const records = await readImportManifest(manifest, {
+      pathColumn,
+      datasetColumn,
+      sheet: f.sheet
+    });
+    const datasetIds = [...new Set(records.map(record => resolveDatasetId(
+      normalizeImportPath(record.path), record.datasetId, routes
+    )))];
+    const schemas = new Map();
+    for (const datasetId of datasetIds) {
+      schemas.set(datasetId, new Map((await listCollectionTags(datasetId)).map(definition => [definition.tag, definition])));
+    }
+    const defaultStatePath = path.join(root, '.fastgpt-import-state.json');
+    const statePath = f.state ? path.resolve(f.state) : defaultStatePath;
+    const stateRelative = path.relative(root, statePath);
+    const stateInsideRoot = stateRelative === '' ||
+      (!stateRelative.startsWith(`..${path.sep}`) && stateRelative !== '..' && !path.isAbsolute(stateRelative));
+    if (f.state && stateInsideRoot) fail('--state 自定义路径必须放在资料目录之外，避免覆盖待导入文件；默认隐藏状态文件除外');
+    if (statePath === manifest || statePath === routesPath) fail('--state 不能指向标签清单或路由文件');
+    const jobs = await prepareImportJobs({
+      rootPath: root,
+      records,
+      routes,
+      schemas,
+      arrayDelimiter: f['array-delimiter'] ? String(f['array-delimiter']) : ';',
+      ignorePaths: [manifest, routesPath, statePath, `${statePath}.lock`].filter(Boolean)
+    });
+    const routesHash = crypto.createHash('sha256').update(JSON.stringify(routes)).digest('hex');
+    const result = await executeTaggedImport({
+      jobs,
+      statePath,
+      lockPath: path.join(root, '.fastgpt-import.lock'),
+      identity: { root, base: getBase(), routesHash },
+      dryRun: !!f['dry-run'],
+      retryUncertainPath: f['retry-uncertain'] ? String(f['retry-uncertain']).replaceAll('\\', '/') : undefined,
+      api: {
+        upload: async job => client.upload('/api/core/dataset/collection/create/localFile', {
+          fields: { data: JSON.stringify({
+            datasetId: job.datasetId,
+            parentId: null,
+            trainingType: 'chunk',
+            chunkTriggerType: 'forceChunk',
+            chunkSettingMode: 'custom',
+            chunkSplitMode: 'size',
+            chunkSize: 2000,
+            indexSize: 2000,
+            customPdfParse: true,
+            autoIndexes: true,
+            imageIndex: true,
+            dataEnhanceCollectionName: true,
+            indexPrefixTitle: true
+          }) },
+          file: { name: path.basename(job.fullPath), buffer: job.buffer }
+        }),
+        setTags: ({ datasetId, collectionId, tags }) => client.post('/api/proApi/core/dataset/tag/batchSetCollectionTags', {
+          datasetId,
+          collectionIds: [collectionId],
+          mode: 'add',
+          tags: tags.map(({ tagId, value }) => ({ tagId, value }))
+        }),
+        getTags: async collectionId => {
+          const detail = await client.get(`/api/core/dataset/collection/detail?id=${encodeURIComponent(collectionId)}`);
+          return (detail?.collection || detail)?.tags || [];
+        }
+      }
+    });
+    out(result);
+    if (!result.ok) process.exitCode = 1;
+  },
+
   /**
    * QA 模式：导入问答对
    * 用法: ds add-qa <datasetId> --file qa.json [--name FAQ]
@@ -3378,6 +3485,7 @@ const commands = {
           'collections <datasetId> [--parent-id 目录] [--type apiFile|folder] [--size N] [--search 词]',
           'add-file <id> <file>                       单文件上传（pdf/docx/xlsx/md…）',
           'add-batch <id> <路径...> [--ext pdf,md] [--concurrency 3]   批量递归上传',
+          'import-tagged <目录> --manifest tags.xlsx|csv|json [--routes routes.json] [--dry-run]  按清单分库上传并写标签',
           'add-text <id> --name 标题 --text 内容',
           'add-link <id> <url> [--selector CSS]       网页链接集合',
           'add-images <id> <图1> [图2...] [--name N]   图片集合（多模态）',
