@@ -9,7 +9,7 @@ import { setBlock, getBlock, clearBlock, blockEnvelope } from '../lib/blocker.mj
 import { updateCollaborators, RESOURCES } from '../lib/collaborators.mjs';
 import { ensureAuth, scanLogin, resumeScan, passwordLogin, checkAuth, isAuthError } from '../lib/auth.mjs';
 import { node } from '../lib/nodes.mjs';
-import { edge, validateWorkflow, normalizeWorkflow } from '../lib/validate.mjs';
+import { edge, validateWorkflow, normalizeWorkflow, collectDatasetRefs, judgeDatasetRefs } from '../lib/validate.mjs';
 import { diffWorkflow } from '../lib/diff.mjs';
 import { checkCanvas } from '../lib/ui-check.mjs';
 import { compareRuleset, calibrateRuleset, DIAGNOSTIC_CODES } from '../lib/ruleset.mjs';
@@ -64,6 +64,13 @@ const PRINCIPLE = {
 // ---------- 命令文档：让 --help 能逐层下钻 ----------
 // agent 的第一反应就是 `xxx --help`；以前 `fastgpt wf --help` 直接报「未知命令: wf」。
 const COMMAND_DOC = {
+  'ds list': {
+    usage: 'fastgpt ds list [--all|--tree] [--parentId <id>] [--search 词]',
+    about: '知识库列表。默认只看根级（和 Web 侧边栏一致）；--all 递归下钻文件夹，含嵌套在目录里的库。',
+    flags: { '--all': '递归列出全部知识库（含文件夹内嵌套库）', '--tree': '同 --all', '--parentId <id>': '只看某文件夹下', '--search 词': '名称子串匹配' },
+    output: '默认：数组[{_id,name,type,parentId,vectorModel}]；--all：{total,datasets,folders,nested,maxDepth,list[{name,type,parentId,depth,path}]}',
+    examples: ['fastgpt ds list', 'fastgpt ds list --all', 'fastgpt ds list --all --search 报销']
+  },
   'wf lint': {
     usage: 'fastgpt wf lint <file> [--fix out.json] [--inline-consts]',
     about: '离线体检：规范化 + 校验。不触网、不需要登录。',
@@ -513,24 +520,68 @@ async function checkToolContracts(nodes) {
   return problems;
 }
 
-/** dry-run 的 ID 真实性检查：datasetId 必须存在于当前团队 */
-async function verifyResourceIds(nodes) {
-  const dsIds = new Set();
-  for (const n of nodes) {
-    for (const inp of n.inputs || []) {
-      if (inp.key !== 'datasets' || !Array.isArray(inp.value)) continue;
-      for (const d of inp.value) {
-        if (d && typeof d === 'object' && d.datasetId) dsIds.add(d.datasetId);
-      }
+/**
+ * 知识库白名单：递归下钻文件夹，把「建在文件夹里的嵌套知识库」也收进来。
+ * 三条纪律（每条都对应一次线上误判）：
+ *   1. folder 与 dataset 分开收集 —— 混在一个数组里，文件夹 id 就能冒充 datasetId 过检；
+ *   2. 单层失败只记录、不炸全树 —— 原先 try 包在递归外层，任一层 403/超时就把 realDs
+ *      留在初始值 []，整份工作流的知识库全被判「不存在」，报错还指向 ds list；
+ *   3. 深度上限 —— 服务端返回成环时不死循环。
+ */
+const DATASET_SCAN_MAX_DEPTH = 10;
+const isDatasetFolder = t => t === 'folder';
+
+async function scanDatasetWhitelist() {
+  const datasets = new Set();
+  const folders = new Set();
+  const errors = [];
+  const collect = async (parentId, depth) => {
+    if (depth > DATASET_SCAN_MAX_DEPTH) {
+      errors.push({ parentId, reason: `目录深度超过 ${DATASET_SCAN_MAX_DEPTH} 层，停止下钻` });
+      return;
     }
+    let list;
+    try {
+      list = (await client.post('/api/core/dataset/list', { parentId, searchKey: '' })) || [];
+    } catch (e) {
+      errors.push({ parentId, reason: e.message || String(e) });
+      return;
+    }
+    for (const x of list) {
+      if (!x || !x._id) continue;
+      if (isDatasetFolder(x.type)) { folders.add(x._id); await collect(x._id, depth + 1); }
+      else datasets.add(x._id);
+    }
+  };
+  await collect(null, 0);
+  return { datasets: [...datasets], folders: [...folders], errors };
+}
+
+/**
+ * 工作流里的知识库引用 vs 团队白名单。
+ * 静态 id 才比对；引用形式/非法值单列；白名单扫描不完整时不做「不存在」判定。
+ */
+async function verifyDatasetRefs(nodes) {
+  const refs = collectDatasetRefs(nodes);
+  if (!refs.ids.length) {
+    return { ...refs, checked: 0, invalid: [], folderRefs: [], notFound: [], incomplete: false, errors: [] };
   }
-  if (!dsIds.size) return { checked: 0, invalid: [] };
-  let realDs = [];
-  try {
-    const d = await client.post('/api/core/dataset/list', { parentId: null, searchKey: '' });
-    realDs = (d || []).map(x => x._id);
-  } catch {}
-  return { checked: dsIds.size, invalid: [...dsIds].filter(id => !realDs.includes(id)) };
+  const scan = await scanDatasetWhitelist();
+  return { ...refs, ...judgeDatasetRefs({ ids: refs.ids, ...scan }) };
+}
+
+/** 把「哪些东西没校验」打成一段人话，避免 agent 把「跳过」读成「通过」 */
+function printDatasetRefWarnings(refs) {
+  const lines = [];
+  if (refs.incomplete) lines.push(`白名单扫描不完整（${refs.errors.length} 处失败），本次不判定 datasetId 是否存在`);
+  for (const e of refs.errors || []) lines.push(`  ${e.parentId || 'root'}: ${e.reason}`);
+  for (const d of refs.dynamic || []) lines.push(`  ${d.node}: ${d.why}`);
+  for (const m of refs.malformed || []) lines.push(`  ${m.node}: datasets 里有非法项 ${JSON.stringify(m.value).slice(0, 80)}`);
+  for (const s of refs.suspect || []) lines.push(`  ${s.node}: datasetId "${s.id}" 不是 24 位 ObjectId（占位符没替换？）`);
+  if (!lines.length) return;
+  console.error('\n⚠️  知识库引用未完全校验：');
+  lines.forEach(x => console.error(`   ${x}`));
+  console.error('');
 }
 
 /** 运行时体检：真跑一次 OpenAPI，返回结构化轨迹（不做 out） */
@@ -1780,19 +1831,35 @@ const commands = {
       process.exit(2);
     }
 
-    const ids = await verifyResourceIds(nodes);
-    if (ids.invalid.length) {
+    const refs = await verifyDatasetRefs(nodes);
+    printDatasetRefWarnings(refs);
+    // 白名单不完整时一律不下结论：宁可少报，不能把正常的嵌套知识库误判成不存在
+    if (!refs.incomplete && refs.folderRefs.length) {
+      failCli('dataset_is_folder', {
+        message: `datasets 里放的是文件夹 id，不是知识库 id：${refs.folderRefs.join(', ')}`,
+        hint: '用 fastgpt ds list --all 找到文件夹里真正的 datasetId',
+        details: { folderIds: refs.folderRefs }
+      });
+    }
+    if (!refs.incomplete && refs.notFound.length) {
       failCli('dataset_not_found', {
-        message: `引用了当前团队不存在的知识库：${ids.invalid.join(', ')}`,
-        hint: '运行 fastgpt ds list 查看可用知识库 ID',
-        details: { invalidDatasetIds: ids.invalid }
+        message: `引用了当前团队不存在的知识库：${refs.notFound.join(', ')}`,
+        hint: '运行 fastgpt ds list --all 查看可用知识库 ID（含文件夹内嵌套库）',
+        details: { invalidDatasetIds: refs.notFound }
       });
     }
 
     if (f['dry-run']) {
       out(withNotice(
         { ok: true, dryRun: true, nodes: nodes.length, edges: edges.length,
-          warnings: v.warnings, verified: { modelId: true, datasetIds: ids.checked } },
+          warnings: v.warnings,
+          verified: {
+            modelId: true,
+            datasetIds: refs.incomplete ? 0 : refs.checked,
+            datasetScan: refs.incomplete ? 'incomplete' : 'ok',
+            uncheckedRefs: refs.dynamic.length + refs.malformed.length,
+            ...(refs.incomplete ? { scanErrors: refs.errors } : {})
+          } },
         Notice.dryRunOnly()
       ));
       return;
@@ -2009,12 +2076,26 @@ const commands = {
       if (!f['no-model-hook']) nodes = await ensureModelIdHook(nodes, { autoFill: !f['no-auto-model'] });
       const v = validateWorkflow({ nodes, edges, chatConfig });
       if (!v.ok) { push('validate', false, { errors: v.errors }); stop('validate', v.next, { issues: v.issues }); }
-      const ids = await verifyResourceIds(nodes);
-      if (ids.invalid.length) {
-        push('resource_ids', false, { invalid: ids.invalid });
-        await stop('resource_ids', 'datasetId 不在当前团队：先 fastgpt ds list 确认', { invalidDatasetIds: ids.invalid });
+      const refs = await verifyDatasetRefs(nodes);
+      if (refs.incomplete) {
+        // 扫描不完整 = 白名单不可信，此时不能把引用判成不存在（否则网络抖一下就 Deployment 失败）
+        push('resource_ids', true, {
+          datasetIds: refs.checked,
+          skipped: '白名单扫描不完整，已跳过 datasetId 真实性判定',
+          errors: refs.errors
+        });
+      } else if (refs.folderRefs.length) {
+        push('resource_ids', false, { folderRefs: refs.folderRefs });
+        await stop('resource_ids',
+          'datasets 里放的是文件夹 id：用 fastgpt ds list --all 找出里面真正的 datasetId',
+          { folderRefs: refs.folderRefs });
+      } else if (refs.notFound.length) {
+        push('resource_ids', false, { invalid: refs.notFound });
+        await stop('resource_ids', 'datasetId 不在当前团队：先 fastgpt ds list --all 确认（含文件夹内嵌套库）',
+          { invalidDatasetIds: refs.notFound });
       }
-      push('validate', true, { datasetIds: ids.checked, warnings: v.warnings.length });
+      push('validate', true, { datasetIds: refs.checked, warnings: v.warnings.length,
+        ...(refs.dynamic.length + refs.malformed.length ? { uncheckedRefs: refs.dynamic.length + refs.malformed.length } : {}) });
 
       // ④ 部署
       await deployWorkflow({ appId, nodes, edges, chatConfig, versionName: f.versionName || 'cli-verify', publish: true });
@@ -2516,9 +2597,41 @@ const commands = {
   },
 
   // ===== 知识库 =====
+  /**
+   * 知识库列表。默认只看根级（parentId: null），和 Web 侧边栏一致；
+   * --all 递归下钻文件夹 —— 不看这个就会以为「嵌套在文件夹里的库不存在」。
+   */
   async 'ds list'(args, f) {
-    const d = await client.post('/api/core/dataset/list', { parentId: null, searchKey: f.search || '' });
-    out((d || []).map(x => ({ _id: x._id, name: x.name, type: x.type, vectorModel: x.vectorModel?.name })));
+    const searchKey = f.search || '';
+    const row = (x, parentId, depth, path) => ({
+      _id: x._id, name: x.name, type: x.type, parentId: parentId ?? null,
+      ...(f.all || f.tree ? { depth, path: [...path, x.name].join(' / ') } : {}),
+      vectorModel: x.vectorModel?.name
+    });
+    if (!f.all && !f.tree) {
+      const d = await client.post('/api/core/dataset/list', { parentId: f.parentId || null, searchKey });
+      out((d || []).map(x => row(x, f.parentId || null, 0, [])));
+      return;
+    }
+    const rows = [];
+    const walk = async (parentId, depth, path) => {
+      if (depth > DATASET_SCAN_MAX_DEPTH) return;
+      const list = (await client.post('/api/core/dataset/list', { parentId, searchKey })) || [];
+      for (const x of list) {
+        const label = [...path, x.name];
+        rows.push(row(x, parentId, depth, path));
+        if (isDatasetFolder(x.type)) await walk(x._id, depth + 1, label);
+      }
+    };
+    await walk(null, 0, []);
+    out({
+      total: rows.length,
+      datasets: rows.filter(r => !isDatasetFolder(r.type)).length,
+      folders: rows.filter(r => isDatasetFolder(r.type)).length,
+      nested: rows.filter(r => r.depth > 0).length,   // >0 说明确实存在嵌套
+      maxDepth: rows.length ? Math.max(...rows.map(r => r.depth)) : 0,
+      list: rows
+    });
   },
 
   /**

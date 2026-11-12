@@ -1,7 +1,7 @@
 // 离线回归测试：不触网，验证构造器、校验规则、错误契约
 // 运行: node tests/smoke.mjs
 import { node, VARP, REF } from '../lib/nodes.mjs';
-import { validateWorkflow, normalizeWorkflow, edge, chain, VARIABLE_NODE_ID } from '../lib/validate.mjs';
+import { validateWorkflow, normalizeWorkflow, edge, chain, VARIABLE_NODE_ID, collectDatasetRefs, judgeDatasetRefs } from '../lib/validate.mjs';
 import { cliError, BASE_PRESETS, WEBSITE_TO_PRESET, Notice, withNotice, exitCodeFor } from '../lib/errors.mjs';
 import { blockEnvelope } from '../lib/blocker.mjs';
 import { mergeCollaboratorList, RESOURCES } from '../lib/collaborators.mjs';
@@ -620,6 +620,47 @@ section('folder 提示');
   ok('folder notice 不提对话失败', !/无法对话/.test(f.message));
   const a = Notice.appCreated('6ae000000000000000000000');
   ok('app notice 仍提示节点为空', a.type === 'app_created' && /无法对话/.test(a.message));
+}
+
+// ---------- 知识库引用校验（嵌套文件夹 / 引用形式）----------
+section('知识库引用校验');
+{
+  const DS_A = 'a'.repeat(24), DS_B = 'b'.repeat(24), FOLDER = 'c'.repeat(24);
+  const nodes = [
+    node.datasetSearch('n_ds1', { datasets: [{ datasetId: DS_A, name: '制度' }], question: ['n_start', 'userChatInput'] }),
+    node.datasetSearch('n_ds2', { datasets: [{ datasetId: DS_A, name: '制度' }, { datasetId: DS_B, name: '文件夹里的库' }], question: ['n_start', 'userChatInput'] })
+  ];
+  const refs = collectDatasetRefs(nodes);
+  ok('引用去重', refs.ids.length === 2 && refs.ids.includes(DS_A) && refs.ids.includes(DS_B));
+  ok('无动态/非法项', refs.dynamic.length === 0 && refs.malformed.length === 0 && refs.suspect.length === 0);
+
+  // 白名单递归收集：文件夹本身 + 里面的 dataset
+  const scan = { datasets: [DS_A, DS_B], folders: [FOLDER], errors: [] };
+  const j = judgeDatasetRefs({ ids: refs.ids, ...scan });
+  ok('文件夹内嵌套库不误判不存在', j.invalid.length === 0 && j.notFound.length === 0, JSON.stringify(j));
+  ok('checked 计数正确', j.checked === 2);
+
+  // 反向误判：folder id 当 datasetId 用
+  const j2 = judgeDatasetRefs({ ids: [FOLDER], ...scan });
+  ok('folder 当 datasetId → folderRefs', j2.folderRefs.length === 1 && j2.notFound.length === 0);
+
+  // 扫描不完整：白名单不可信，调用方必须放弃「不存在」判定
+  const j3 = judgeDatasetRefs({ ids: [DS_A, 'd'.repeat(24)], datasets: [], folders: [], errors: [{ parentId: FOLDER, reason: 'HTTP 403' }] });
+  ok('部分层失败 → incomplete', j3.incomplete === true && j3.errors.length === 1);
+  ok('incomplete 时 invalid 只供参考', j3.invalid.length === 2);
+
+  // 引用形式 / 非法值 / 占位符：静态解析不了，单列而不是判不存在
+  const dynNodes = [
+    { nodeId: 'n_ref', inputs: [{ key: 'datasets', value: ['n_start', 'datasetId'] }] },
+    { nodeId: 'n_bad', inputs: [{ key: 'datasets', value: [{ name: '缺 datasetId' }] }] },
+    { nodeId: 'n_raw', inputs: [{ key: 'datasets', value: 'abc' }] },
+    { nodeId: 'n_ph', inputs: [{ key: 'datasets', value: [{ datasetId: '<YOUR_DATASET_ID>' }] }] }
+  ];
+  const dyn = collectDatasetRefs(dynNodes);
+  ok('引用形式进 dynamic', dyn.dynamic.some(d => d.node === 'n_ref'));
+  ok('非数组进 dynamic', dyn.dynamic.some(d => d.node === 'n_raw'));
+  ok('缺 datasetId 进 malformed', dyn.malformed.length === 1 && dyn.malformed[0].node === 'n_bad');
+  ok('占位符进 suspect 但仍参与比对', dyn.suspect.length === 1 && dyn.ids.includes('<YOUR_DATASET_ID>'));
 }
 
 // ---------- 输出 ----------

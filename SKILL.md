@@ -177,7 +177,7 @@ fastgpt wf verify <file> [--inline-consts] [--variables '{...}'] [--ui-cmd '...{
 | `FASTGPT_BASE` | 问用户「你的 FastGPT 地址是什么？」 | 猜一个地址 |
 | 账号凭证 | 问用户「账号密码或 token？」 | 跳过登录直接写 DSL |
 | `modelId` | 运行 `fastgpt model id`，无结果则引导用户去 WebUI 操作 | ❌ **用 `0000...` 或任意 24 位 hex 伪造** |
-| `datasetId` | `fastgpt ds list` 让用户确认 | 编一个 ID |
+| `datasetId` | `fastgpt ds list --all` 让用户确认（库建在文件夹里必须加 `--all`） | 编一个 ID |
 
 **为什么不能伪造 modelId**：校验器只能检查「格式是不是 24 位 hex」，
 `000000000000000000000000` 能通过格式校验，但部署后 100% 报
@@ -592,7 +592,7 @@ fastgpt auth scan --wait --session-id 9460
 0.5 `info` —— 看清家底（成员数、工作流数、知识库数、配额、权限）
 1. `auth whoami` 确认身份、拿 teamId/tmbId
 2. `wf get <任意已有应用>` 提取 `<LLM_MODEL_OBJECT_ID>`（不要猜）
-3. `ds list` 拿知识库 ID（如果要用 RAG）
+3. `ds list --all` 拿知识库 ID（如果要用 RAG；嵌套在文件夹里的库只有 `--all` 才列得出）
 4. 写 DSL 文件
 5. `wf build xxx.json --dry-run` —— **必须通过，有 error 就改 DSL，不要绕过**
 6. `wf build xxx.json` 部署
@@ -728,7 +728,7 @@ fastgpt wf get <appId> [--out wf.json]
 fastgpt wf publish <appId>
 
 # 知识库
-fastgpt ds list
+fastgpt ds list --all          # 递归列出全部知识库（含文件夹内嵌套库）
 fastgpt ds create --name "知识库名"
 fastgpt ds detail <datasetId>
 fastgpt ds delete <datasetId>
