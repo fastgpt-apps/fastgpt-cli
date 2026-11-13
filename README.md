@@ -18,7 +18,7 @@ code 节点里出现 `detectChartType` / 字段别名表 / 中文问法正则 �
 npm install -g github:fastgpt-apps/fastgpt-cli
 ```
 
-零依赖，需要 Node 18+。装完直接使用 `fastgpt` 命令，不需要进入任何目录。
+需要 Node 18+。装完直接使用 `fastgpt` 命令，不需要进入任何目录。
 
 > 开发模式：`git clone` 仓库后 `npm link`。生产使用建议走上面的全局安装。
 
@@ -55,7 +55,7 @@ fastgpt auth scan
 
 ## 能做什么
 
-45 个命令，覆盖 FastGPT 的完整生命周期。
+46 个命令，覆盖 FastGPT 的完整生命周期。
 
 | 组 | 命令数 | 能力 |
 |---|---|---|
@@ -64,12 +64,12 @@ fastgpt auth scan
 | `model` | 2 | 提取真实 modelId、列出模型 |
 | `app` | 7 | 创建、列表、详情、更新、删除、复制 |
 | `wf` | 10 | `build` / `lint` / `verify` / `diff` / `check-run` / `versions` / `ruleset` / `get` / `validate` / `publish` |
-| `ds` | 30 | 知识库、集合、文档、QA、训练、检索、权限、集合标签 |
+| `ds` | 31 | 知识库、集合、文档、QA、训练、检索、权限、集合标签 |
 | `perm` | 6 | 成员、权限、协作者 |
 | `chat` | 1 | 运行对话，支持 SSE 流式和节点轨迹 |
 | `apikey` | 1 | 创建 API Key |
 
-> 上表共 **70 条**命令（含 `start` / `schema` / `find` / `tool` / `agent` / `clean` 等单条组）。`fastgpt help <组>` 可逐层下钻到每条命令的参数。
+> 上表共 **71 条**命令（含 `start` / `schema` / `find` / `tool` / `agent` / `clean` 等单条组）。`fastgpt help <组>` 可逐层下钻到每条命令的参数。
 
 ```bash
 fastgpt help                    # 全部命令
@@ -314,6 +314,8 @@ fastgpt ds collections <datasetId> [--parent-id 目录] [--type apiFile|folder] 
 
 fastgpt ds add-file    <datasetId> ./doc.pdf                     # 单文件
 fastgpt ds add-batch   <datasetId> ./docs --ext pdf,docx,md      # 批量递归
+fastgpt ds import-tagged ./单库资料 --manifest tags.xlsx --dataset-id DATASET_ID --dry-run # 单库导入，无需路由文件
+fastgpt ds import-tagged ./多库资料 --manifest tags.xlsx --routes routes.json --dry-run # 分库导入
 fastgpt ds add-text    <datasetId> --name 标题 --text 内容
 fastgpt ds add-link    <datasetId> https://x.com --selector article
 fastgpt ds add-images  <datasetId> a.png b.jpg --name 图集        # 多模态图片集
@@ -354,6 +356,10 @@ fastgpt ds collections <datasetId> --tag 保密等级=内部
 四种标签类型：`string`（自由文本）/ `number` / `datetime`（存 UTC 毫秒，`--value` 可写 `2026-01-01`）/ `array`（`--value a,b` 或 JSON 数组，配 `--append` 追加去重，默认覆盖）。
 
 `ds collections` 默认输出已含 `tags: [{ tag, value }]`。
+
+`ds import-tagged` 可直接读取 XLSX/XLSM、CSV 或 JSON 标签清单，按相对文件路径匹配多层目录，并自动上传、写入及回读核验标签。单库导入可传 `--dataset-id <ID>`，CLI 会根据资料目录和清单中的完整路径自动选择对应行，不需要 `routes.json` 或 `--manifest-prefix`；多库导入仍可用 `routes.json`，表格也可逐行提供 `datasetId`。若自动路径匹配存在歧义，可用 `--manifest-prefix` 明确指定。Excel/CSV 会自动识别常见中文路径列并忽略常见序号列；其他说明列可用 `--ignore-columns` 排除。加 `--create-missing-tags` 可在正式导入前自动创建缺少的标签维度（默认 string），`--dry-run` 下只预览而不创建；特殊类型可用 `--tag-types` 显式指定。建议先 `--dry-run`，完整示例及续跑说明见 [文档导入与标签流程](docs/dataset-import-and-tagging.md)。
+
+批量文件导入和逐文档标签映射的标准操作流程见 [文档导入与标签流程](docs/dataset-import-and-tagging.md)。
 
 ### 第三方知识库（API 知识库）
 
