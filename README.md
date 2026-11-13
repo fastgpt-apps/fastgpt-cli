@@ -128,8 +128,10 @@ $ fastgpt info
 # 1. 拿模型 ObjectId（必须有真实的应用配过模型）
 fastgpt model id
 
-# 2. 建应用
+# 2. 建应用（可选：先建文件夹，再用 --folder 归入）
 fastgpt app create --name "智能客服" --type advanced
+fastgpt app create --name "中车" --type folder              # 文件夹
+fastgpt app create --name "通用文档服务" --folder <folderId>   # 直接建在文件夹里
 
 # 3. 写 DSL
 cat > wf.json <<'EOF'
@@ -272,7 +274,12 @@ fastgpt chat run --appId <APP_ID> -q "你好"
 
 # 看节点执行轨迹
 fastgpt chat run --appId <APP_ID> -q "你好" --detail
+
+# 带文件（只收公网 URL，多个逗号分隔；图片走 image_url，其它走 file_url）
+fastgpt chat run --appId <APP_ID> -q "总结这份合同" --file https://oss.example.com/a.pdf
 ```
+
+> OpenAPI **不支持直接上传文件**（官方文档明说），所以 `--file` 只接受公网可访问的链接。传本地路径会被直接打回并提示改用 `ds add-file` 建知识库。
 
 ### 知识库
 

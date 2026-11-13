@@ -19,7 +19,7 @@ fastgpt wf build examples/dsl-basic.json             # 再写入
 需要替换：
 - `<YOUR_APP_ID>` 应用 ID（`app create` 返回）
 - `<YOUR_LLM_MODEL_OBJECT_ID>` 模型 ObjectId（从已有应用节点里取）
-- `<YOUR_DATASET_ID>` 知识库 ID（`ds list` 获取）
+- `<YOUR_DATASET_ID>` 知识库 ID（`ds list --all` 获取，含文件夹内嵌套库）
 
 ## dsl-contract-review.json
 
