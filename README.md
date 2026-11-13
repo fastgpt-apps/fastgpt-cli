@@ -307,7 +307,8 @@ fastgpt ds collections <datasetId> [--parent-id 目录] [--type apiFile|folder] 
 
 fastgpt ds add-file    <datasetId> ./doc.pdf                     # 单文件
 fastgpt ds add-batch   <datasetId> ./docs --ext pdf,docx,md      # 批量递归
-fastgpt ds import-tagged ./资料 --manifest tags.xlsx --routes routes.json --dry-run # 分库导入并打标签
+fastgpt ds import-tagged ./单库资料 --manifest tags.xlsx --dataset-id DATASET_ID --dry-run # 单库导入，无需路由文件
+fastgpt ds import-tagged ./多库资料 --manifest tags.xlsx --routes routes.json --dry-run # 分库导入
 fastgpt ds add-text    <datasetId> --name 标题 --text 内容
 fastgpt ds add-link    <datasetId> https://x.com --selector article
 fastgpt ds add-images  <datasetId> a.png b.jpg --name 图集        # 多模态图片集
@@ -349,7 +350,7 @@ fastgpt ds collections <datasetId> --tag 保密等级=内部
 
 `ds collections` 默认输出已含 `tags: [{ tag, value }]`。
 
-`ds import-tagged` 可直接读取 XLSX/XLSM、CSV 或 JSON 标签清单，按相对文件路径匹配多层目录，使用 `routes.json` 将目录路由到不同知识库，并自动上传、写入及回读核验标签。建议先 `--dry-run`，完整示例及续跑说明见 [文档导入与标签流程](docs/dataset-import-and-tagging.md)。
+`ds import-tagged` 可直接读取 XLSX/XLSM、CSV 或 JSON 标签清单，按相对文件路径匹配多层目录，并自动上传、写入及回读核验标签。单库导入可传 `--dataset-id <ID>`，CLI 会根据资料目录和清单中的完整路径自动选择对应行，不需要 `routes.json` 或 `--manifest-prefix`；多库导入仍可用 `routes.json`，表格也可逐行提供 `datasetId`。若自动路径匹配存在歧义，可用 `--manifest-prefix` 明确指定。Excel/CSV 会自动识别常见中文路径列并忽略常见序号列；其他说明列可用 `--ignore-columns` 排除。加 `--create-missing-tags` 可在正式导入前自动创建缺少的标签维度（默认 string），`--dry-run` 下只预览而不创建；特殊类型可用 `--tag-types` 显式指定。建议先 `--dry-run`，完整示例及续跑说明见 [文档导入与标签流程](docs/dataset-import-and-tagging.md)。
 
 批量文件导入和逐文档标签映射的标准操作流程见 [文档导入与标签流程](docs/dataset-import-and-tagging.md)。
 
