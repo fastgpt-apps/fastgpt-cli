@@ -52,6 +52,94 @@ description: "管理 FastGPT 的唯一推荐方式。工作流必须用本 CLI �
 
 发布前必须 `wf check-run` 再看一遍，因为**服务端兼容裸写法**，功能正常不代表界面正常。
 
+### 🚨 红线五：并行容器（parallelRun）有三个必填结构，CLI 以前完全没管
+
+`parallelRun` 里跑循环体时，FastGPT 靠三样东西判断「谁在我肚子里」，缺一个画布就报错：
+
+```
+① parallelRun.inputs[childrenNodeIdList] = [loopStart, ..., loopEnd]   ← 完整链，不是首尾两个
+② 每个子节点.parentNodeId = parallelRun.nodeId                          ← 少一个就「不在同一流程作用域」
+③ loopEnd.inputs[loopEndInput].value = [上游节点, 该节点的输出key]        ← 少 value 就「需填写必填项」
+```
+
+症状与报错一一对应：
+
+| 缺什么 | 画布报什么 |
+|---|---|
+| `parentNodeId` | `节点 X 与 Y 不在同一流程作用域，不能直接连线` |
+| `childrenNodeIdList` 不全 | `未与其他节点连线` |
+| `loopEndInput.value` | `需填写必填项 loopEndInput`（并显示「选择引用变量」空占位） |
+
+**0.4.2 起 `normalizeWorkflow` 会自动补全**（从 edges 推断循环体链 + 补 parentNodeId + 补 loopEndInput），
+`autoFixed` 里会列出来。但如果你手写原生节点，仍要自己保证这三处。
+
+**排查姿势**：`wf diff <appId> <file>` 看不出差异时，说明服务端结构一致，问题在渲染层 ——
+用 CDP 抓该节点的 `innerText`，「待完善」区块后面会直接写明缺什么。
+
+---
+
+### 🚨 红线六：`publish` 会静默丢节点，必须回读校验
+
+服务端会**静默丢弃「结构不合法」的节点**，`publish` 照样返回 200。实测：
+
+```
+提交 9 节点 → 实存 3 节点
+提交 37 节点 → 实存 29 节点（丢的正好是带 x/y 的那批）
+```
+
+**0.4.2 起 `deployWorkflow` 会自动回读比对**，数量不符直接报错并列出丢失的节点/边。
+
+常见丢弃原因：
+- 节点带 `x`/`y` 字段（官方只认 `position`，未知字段被 zod 拒 → 整节点丢）→ 0.4.2 起自动搬进 `position`
+- `childrenNodeIdList` 与实际子节点不一致
+- 引用了不存在的上游输出
+
+---
+
+### 🚨 红线七：`autoSave` 必须为 true，否则画布纹丝不动
+
+`POST /api/core/app/version/publish` 带 `isPublish:true, autoSave:false` 时**只写版本，不写草稿**，
+而画布读的是草稿 `app.nodes`。所以会出现「build 返回 ok、UI 检查也过，但打开画布毫无变化」。
+
+0.4.1 的 `deployWorkflow` 写成 `autoSave: !publish`，就是踩了这个坑。
+
+---
+
+### 🚨 红线八：code 节点的输入输出结构（踩了四个）
+
+```jsonc
+// ① outputs 必须带系统输出，给了自定义项也不能顶替
+"outputs": [
+  { "id":"system_rawResponse","key":"system_rawResponse","type":"static","valueType":"object","label":"workflow:full_response_data" },
+  { "id":"error","key":"error","type":"error","valueType":"string","label":"workflow:error_text" },
+  { "id":"自己定义的输出", ... }
+]
+
+// ② system_addInputParam 必须有 customInputConfig，否则「自定义变量」表格渲染不出来
+"customInputConfig": { "selectValueTypeList": [...15种...], "showDefaultValue": true, "showDescription": false }
+
+// ③ codeType / code 走 hidden + custom，不要用 select
+// ④ catchError 默认 false：为 true 时每个代码节点多一个「错误信息」出口 + 一条 source_catch 边
+//    （画布上表现为「每个节点到下游有两条线」）
+```
+
+---
+
+### 🚨 红线九：画布检查要看「待完善」，不是猜节点名
+
+FastGPT 自己在画布上做节点健康检查，命中时会显示「待完善：」区块。**这是最可靠的判据**，比匹配节点名靠谱得多。
+
+0.4.2 起 `ui-check` 已改成：
+- 全量抓 `innerText`（以前 `slice(0,4000)`，而 35 节点画布有 12000+ 字，后半部分永远漏检）
+- 关键词补齐 `需填写必填项` / `无效变量` / `不在同一流程作用域` / `未与其他节点连线`
+- 只要出现「待完善」→ `verdict: canvas_pending`（新增状态，区别于 canvas_broken）
+
+注意两类**假红字**，不要白改：
+- `错误信息`：code / readFiles 节点的 error 输出通道标志，删不掉也不影响运行
+- `选择引用变量`：code 节点 `system_addInputParam` 空行的占位
+
+---
+
 ### 🚨 红线四：code 节点的 outputs 是服务端硬枚举
 
 `outputs[]` 元素的 `type` / `valueType` 由服务端 zod 严格枚举，写错直接 400 `Data validation error`。

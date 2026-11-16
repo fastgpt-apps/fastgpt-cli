@@ -500,13 +500,109 @@ function lintWorkflow(file, flags = {}) {
   };
 }
 
+/**
+ * 把画布上的「待完善」条目翻译成可执行的修复动作。
+ *
+ * 为什么需要：ui-check 只能读到 FastGPT 的文案，用户/agent 读到「存在未完成的输入变量配置」
+ * 并不知道该改哪个字段。这里把已知的 5 类文案映射到具体命令或字段。
+ */
+/** 单条画布报错 → 一句可执行的动作。agent 只读返回值，所以每个 offender 就地带上它。 */
+function hintForIssue(issue = '') {
+  if (issue.includes('存在未完成的输入变量配置')) {
+    return '该输入的引用值被服务端 strip 成 null/[]：run `fastgpt wf lint <file> --fix fixed.json`，它会按引用源类型自动对齐 valueType';
+  }
+  if (issue.includes('不在同一流程作用域')) {
+    return '并行容器内的节点缺 parentNodeId：同一条 lint --fix 会从 edges 推断循环体并补齐';
+  }
+  if (issue.includes('未与其他节点连线')) {
+    return 'parallelRun 的 childrenNodeIdList 不完整：同一条 lint --fix 会沿 loopStart→loopEnd 补全整条链';
+  }
+  if (issue.includes('需填写必填项')) {
+    return '该输入没有值：查 inputs[key].value 是否为 [nodeId, outputKey]；若 DSL 里写了值却仍是空，说明被服务端 strip 了';
+  }
+  if (issue.includes('无效变量')) {
+    return 'prompt/question 里的 {{$nodeId.key$}} 指向不存在的输出：核对 nodeId 是否存在、outputs[].key 是否拼对';
+  }
+  if (issue.includes('渲染失败') || issue.includes('白屏')) {
+    return '结构损坏：回滚到上一个能渲染的 DSL，再逐节点加回';
+  }
+  return '';
+}
+function fixHintsFor(offenders = []) {
+  const hints = new Set();
+  for (const o of offenders) for (const i of o.issues || []) {
+    const h = hintForIssue(i);
+    if (h) hints.add(h);
+  }
+  return [...hints];
+}
+
 /** 提交（草稿或发布）。返回服务端结果，不做 out。 */
 async function deployWorkflow({ appId, nodes, edges, chatConfig, versionName, publish = true }) {
   await client.post(`/api/core/app/version/publish?appId=${appId}`, {
     nodes, edges, chatConfig,
-    isPublish: publish, autoSave: !publish,
+    // autoSave 必须为 true：publish 只写 version，画布读的是草稿 app.nodes。
+    // 之前写成 !publish（发布时 false），导致「build 成功但画布没变」。
+    isPublish: publish, autoSave: true,
     versionName: versionName || 'v1'
   });
+
+  // ★ 回读校验：服务端会静默丢弃「结构不合法」的节点（实测 9→3、37→29），
+  //   也会把「类型不匹配的引用值」strip 成 null/[]（如 readFiles 的 fileUrlList 变 []）。
+  //   publish 返回 200 不代表存进去了，必须回读比对。
+  await new Promise(r => setTimeout(r, 1200));
+  let saved = null;
+  try { saved = await client.get(`/api/core/app/detail?appId=${appId}`); } catch { /* 读不到就不校验 */ }
+  if (saved) {
+    // 字段级：哪些输入的值被 strip 掉了
+    try {
+      const d = diffWorkflow({
+        submitted: { nodes, edges, chatConfig },
+        stored: { nodes: saved.nodes || [], edges: saved.edges || [], chatConfig: saved.chatConfig || {} },
+      });
+      if ((d.stripped || []).length) {
+        fail(`提交后有 ${d.stripped.length} 处字段被服务端 strip（值变 null/[]，运行时读到空）`, {
+          subtype: 'validation',
+          hint: '引用型输入的值被清空：要么 valueType 与引用源类型不符，要么引用了不存在的节点/输出。'
+              + '先跑 fastgpt wf lint <file> --fix fixed.json（自动对齐类型），再 build；若仍被 strip，'
+              + '就是引用目标不存在——查 details.被strip的字段 里的 nodeId.outputKey。',
+          nextCommand: `fastgpt wf diff ${appId} <file>`,
+          details: {
+            被strip的字段: d.stripped.slice(0, 12),
+            常见原因: [
+              '引用型输入的值类型与引用源不符（跑 wf lint --fix 自动对齐）',
+              '引用指向了不存在的节点/输出（值会被静默清空）',
+              'valueType 写错，如 readFiles 的 fileUrlList 需要 arrayString 而写成了 string',
+            ],
+            nextCommand: `fastgpt wf diff ${appId} <file>`,
+          },
+        });
+      }
+    } catch { /* diff 自身异常不阻断主流程 */ }
+
+    const wantNodes = (nodes || []).length;
+    const gotNodes = (saved.nodes || []).length;
+    const wantEdges = (edges || []).length;
+    const gotEdges = (saved.edges || []).length;
+    if (gotNodes !== wantNodes || gotEdges !== wantEdges) {
+      const lostNodes = (nodes || []).map(n => n.nodeId).filter(id => !(saved.nodes || []).some(x => x.nodeId === id));
+      const lostEdges = (edges || []).filter(e => !(saved.edges || []).some(x => x.source === e.source && x.target === e.target));
+      fail(`服务端静默丢弃了节点：提交 ${wantNodes} 节点 / ${wantEdges} 边，实存 ${gotNodes} / ${gotEdges}`, {
+        subtype: 'validation',
+        details: {
+          丢失节点: lostNodes.slice(0, 10),
+          缺失边: lostEdges.slice(0, 10).map(e => `${e.source}→${e.target}`),
+          常见原因: [
+            '节点字段不符合服务端 zod（如 x/y、未知 renderTypeList 值）',
+            'parallelRun 的 childrenNodeIdList 与实际子节点不一致',
+            '节点引用了不存在的上游输出',
+          ],
+          nextCommand: `fastgpt wf diff ${appId} <file>   # 看服务端改了什么`,
+        },
+      });
+    }
+  }
+
   return { appId };
 }
 
@@ -617,14 +713,31 @@ function printDatasetRefWarnings(refs) {
 
 /** 运行时体检：真跑一次 OpenAPI，返回结构化轨迹（不做 out） */
 async function runWorkflowOnce({ appId, key, variables, question = 'hello', chatId }) {
-  const res = await fetch(`${client.base}/api/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      appId, chatId: chatId || `cli-${Date.now()}`, stream: false, detail: true,
-      variables, messages: [{ role: 'user', content: question }]
-    })
+  // 影子应用刚 create 完，服务端可能还没就绪，第一次请求会 "fetch failed"（网络层，不是 HTTP 错）。
+  // 以前直接把它当失败抛出，导致 wf verify 在「没传 --appId」时永远跑不过 run 步。
+  // 这里对网络层错误重试 2 次（共 3 次尝试），HTTP 非 200 不重试、原样返回让上层判。
+  const payload = JSON.stringify({
+    appId, chatId: chatId || `cli-${Date.now()}`, stream: false, detail: true,
+    variables, messages: [{ role: 'user', content: question }]
   });
+  let res = null;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      res = await fetch(`${client.base}/api/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+        body: payload,
+      });
+      break;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 2) await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+    }
+  }
+  if (!res) {
+    return { ok: false, httpStatus: 0, error: `fetch failed（重试 3 次）：${lastErr?.message || ''}` };
+  }
   const raw = await res.text();
   if (!res.ok) return { ok: false, httpStatus: res.status, error: raw.slice(0, 200) };
   const json = JSON.parse(raw);
@@ -1847,8 +1960,15 @@ const commands = {
 
     const v = validateWorkflow({ nodes, edges, chatConfig });
     if (!v.ok) {
+      // hint 必须直接指向「改哪个字段」，不能只说「有 N 项要改」—— agent 不读文档
+      const firstManual = (v.issues || []).find(i => i.fix !== 'auto');
+      const firstAuto = (v.issues || []).find(i => i.fix === 'auto');
       failCli('workflow_validate_failed', {
-        hint: v.next,
+        hint: firstManual
+          ? `先改 ${firstManual.where || firstManual.code}：${firstManual.message}（这条 lint --fix 修不掉，必须手动改内容）`
+          : firstAuto
+            ? `跑 fastgpt wf lint <file> --fix fixed.json 可以自动修：${firstAuto.where || firstAuto.code} — ${firstAuto.message}`
+            : v.next,
         details: { errors: v.errors, warnings: v.warnings, issues: v.issues,
                    autoFixable: v.issues.filter(i => i.fix === 'auto').length,
                    manualFixRequired: v.issues.filter(i => i.fix !== 'auto').length }
@@ -1888,6 +2008,7 @@ const commands = {
     if (f['dry-run']) {
       out(withNotice(
         { ok: true, dryRun: true, nodes: nodes.length, edges: edges.length,
+          autoFixed: (wf.fixes || []).length ? wf.fixes : undefined,
           warnings: v.warnings,
           verified: {
             modelId: true,
@@ -1910,14 +2031,44 @@ const commands = {
       ? { ok: true, skipped: '--no-ui-check 显式跳过', verdict: 'skipped' }
       : await checkCanvas(appId, { base: getBase(), fingerprint, noCache: f['no-ui-cache'] === false });
     if (!ui.ok) {
+      const offenders = ui.offenders || [];
+      const hints = fixHintsFor(offenders);
       failCli('canvas_render_failed', {
-        message: '工作流已部署，但前端画布渲染不出来',
-        details: { appId, verdict: ui.verdict, nodesFound: ui.nodesFound, errors: ui.errors, sample: ui.sample },
-        nextCommand: `fastgpt wf get ${appId} > wf.json   # 对照 SKILL.md「红线三：前端不认的写法」逐条核`,
+        // ★ committed 与 ok 是两个维度：
+        //   committed=true  → 节点已经在服务端（wf get 能看到），只是画布有问题
+        //   committed=false → 提交本身失败，服务端什么都没变
+        //   以前只有 ok 一个字段，容易误判成「整个没提交」然后反复改。
+        message: ui.pendingCount > 0
+          ? `已提交（${nodes.length} 节点），但画布有 ${ui.pendingCount} 处「待完善」，涉及 ${offenders.length} 个节点`
+          : '工作流已部署，但前端画布渲染不出来',
+        hint: '已提交成功，不要重复 build。按 details.offenders 里每个节点的 fix 字段逐条改；'
+            + '也可以直接跑 fastgpt wf lint <file> --fix fixed.json && fastgpt wf build fixed.json（能自动修的都会修掉）。',
+        details: {
+          committed: true,
+          appId,
+          verdict: ui.verdict,
+          pendingCount: ui.pendingCount || 0,
+          // 每个节点就地带上「怎么修」，agent 不需要自己去映射文案
+          offenders: offenders.map(o => ({
+            ...o,
+            fix: (o.issues || []).map(hintForIssue).filter(Boolean),
+          })),
+          修复建议: hints,
+          errors: ui.errors,
+          nodesFound: ui.nodesFound,
+          sample: ui.sample,
+        },
+        nextCommand: hints.length
+          ? `fastgpt wf lint <file> --fix fixed.json && fastgpt wf build fixed.json`
+          : `fastgpt wf get ${appId} > wf.json   # 对照 SKILL.md 红线三逐条核`,
       });
     }
 
     const payload = { ok: true, appId, nodes: nodes.length, edges: edges.length, publish: published,
+                      // autoFixed：normalize 在提交前自动修掉的问题（valueType 对齐、parentNodeId、
+                      // childrenNodeIdList、loopEndInput、x/y → position）。不输出的话，
+                      // 「我明明写错了却没报错」会让人以为检查没生效。
+                      autoFixed: (wf.fixes || []).length ? wf.fixes : undefined,
                       warnings: v.warnings, ui };
     out(published ? payload : withNotice(payload, Notice.notPublished()));
   },
@@ -1983,7 +2134,7 @@ const commands = {
     const d = await client.get(`/api/core/app/detail?appId=${appId}`);
     await client.post(`/api/core/app/version/publish?appId=${appId}`, {
       nodes: d.nodes, edges: d.edges, chatConfig: d.chatConfig,
-      isPublish: true, autoSave: false, versionName: f.name || 'publish'
+      isPublish: true, autoSave: true, versionName: f.name || 'publish'
     });
     out(withNotice(
       { ok: true, appId },
@@ -2159,6 +2310,13 @@ const commands = {
       if (f.variables) { try { variables = JSON.parse(f.variables); } catch { fail('--variables 需要 JSON 字符串'); } }
       if (!key) {
         push('run', true, { skipped: `没有 API Key（${keyFile}），跳过运行时体检` });
+      } else if (mode === 'shadow') {
+        // 影子应用 create 出来之后 OpenAPI 侧还没就绪，调用会返回 409（不是 200 也不是网络错）。
+        // 影子模式的价值是验证「能不能部署 + 画布能不能渲染」，运行时校验的权威结果
+        // 必须打在真实应用上，所以这里明确跳过并告知怎么补跑。
+        push('run', true, {
+          skipped: '影子应用刚创建，OpenAPI 未就绪（409）；运行时校验请用 --appId <生产应用> 重跑本命令',
+        });
       } else {
         const r = await runWorkflowOnce({ appId, key, variables, question: f.q, chatId: f.chatId });
         push('run', r.ok, {
