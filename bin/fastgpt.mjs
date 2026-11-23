@@ -4,7 +4,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { client, whoami, FastGPTError, isConfigured, saveConfig, getBase, CONFIG_PATH, HOME } from '../lib/client.mjs';
+import { client, whoami, FastGPTError, isConfigured, saveConfig, getBase, CONFIG_PATH, HOME, ACCOUNT } from '../lib/client.mjs';
+import { listAccounts, resolveAccount, activeAccount, setActiveAccount, clearActiveAccount, linkProject, unlinkProject, accountExists, assertAccountName, accountsDir, FG_BASE, accountFromProject, accountFromArgv } from '../lib/account.mjs';
 import { cliError, exitCodeFor, isCliError, BASE_PRESETS, WEBSITE_TO_PRESET, Notice, withNotice } from '../lib/errors.mjs';
 import { setBlock, getBlock, clearBlock, blockEnvelope } from '../lib/blocker.mjs';
 import { updateCollaborators, RESOURCES } from '../lib/collaborators.mjs';
@@ -13,7 +14,13 @@ import { node } from '../lib/nodes.mjs';
 import { edge, validateWorkflow, normalizeWorkflow, collectDatasetRefs, judgeDatasetRefs } from '../lib/validate.mjs';
 import { diffWorkflow } from '../lib/diff.mjs';
 import { checkCanvas } from '../lib/ui-check.mjs';
+import { readToken } from '../lib/browser.mjs';
+import { launchBrowser as launchBrowserEngine, sleep as sleepMs } from '../lib/browser.mjs';
+import { localNodeCatalog, compareNodeCatalog, calibrateNodeCatalog, extractOnlineNodeTypes, NODE_CATALOG_CALIBRATED_WITH } from '../lib/node-catalog.mjs';
+import { inputSchemaToParams, outputSchemaToOutputs, toolDetailToPluginSpec, describeParams } from '../lib/plugin.mjs';
+import { buildSnapshot, diffSnapshot } from '../lib/dsl-snapshot.mjs';
 import { compareRuleset, calibrateRuleset, DIAGNOSTIC_CODES } from '../lib/ruleset.mjs';
+import { DEFECTS, localJudge, remoteJudge, reconcile } from '../lib/wf-diff.mjs';
 import { readImportManifest, loadDatasetRoutes, prepareImportJobs, executeTaggedImport, normalizeImportPath, resolveDatasetId, selectManifestRecordsForRoot, applyImportDatasetId, resolveImportStatePath } from '../lib/import-tagged.mjs';
 
 const out = o => console.log(JSON.stringify(o, null, 2));
@@ -124,12 +131,57 @@ const COMMAND_DOC = {
   },
   'wf versions': { usage: 'fastgpt wf versions <appId>', about: '草稿 / version/latest / 各版本指纹对比。', flags: {}, output: 'rows[] / consistent', examples: [] },
   'wf ruleset': { usage: 'fastgpt wf ruleset [--calibrate]', about: '目标实例版本 vs 内置规则集校准版本，报规则漂移。', flags: { '--calibrate': '输出重新校准步骤' }, output: 'compare.versionMatch / verdict', examples: [] },
+  'wf nodes': {
+    usage: 'fastgpt wf nodes [--calibrate]',
+    about: '节点目录校准：抓线上前端的节点类型枚举，与本地 lib/nodes.mjs 的构造器清单比对，报缺失/多余节点。',
+    flags: { '--calibrate': '只输出重新校准步骤，不抓网' },
+    output: 'compare{missingLocal[],extraLocal[],verdict} / online.types / local.nodes',
+    examples: ['fastgpt wf nodes', 'fastgpt wf nodes --calibrate']
+  },
+  'wf diffcheck': {
+    usage: 'fastgpt wf diffcheck <appId> [--file <本地workflow.json>] [--only defect1,defect2]',
+    about: '前后端校验差分：取真实 workflow → 注入已知缺陷 → 本地 validate 与线上画布各判一次 → 报漂移。平台升级后验证本地规则是否失准，或改 validate.mjs 后做回归。',
+    flags: {
+      '--file <json>': '用本地 workflow 当底稿（不读线上 app）',
+      '--only <ids>': '只测指定缺陷，逗号分隔（可选：isolated_edge,bad_valuetype,dead_ref_in_code,ifelse_bool,canedit_const）'
+    },
+    output: 'driftCount / summary{local_miss,local_over} / rows[{id,localHit,remoteHit,drift,local,remote}]',
+    examples: ['fastgpt wf diffcheck 6ae0...', 'fastgpt wf diffcheck 6ae0... --only ifelse_bool,canedit_const']
+  },
   start: {
     usage: 'fastgpt start',
     about: '根据当前环境与目录状态，告诉你「下一步该敲哪一条命令」。',
     flags: {},
     output: 'next_command / why / context',
     examples: ['fastgpt start']
+  },
+  'account list': { usage: 'fastgpt account list', about: '列出所有账号（实例×凭据）：名称/域名/版本/登录状态/项目绑定。', flags: {}, output: '{accountsDir, active, current, projectBinding, accounts[]}', examples: ['fastgpt account list'] },
+  'account current': { usage: 'fastgpt account current', about: '显示当前生效的账号及来源（arg/env/project/active/default）。', flags: {}, output: '{name, source, home, base, projectBinding}', examples: ['fastgpt account current'] },
+  'account create': {
+    usage: 'fastgpt account create <名字> --base <地址>|--preset <cn|global|local> [--use] [--link]',
+    about: '新建账号目录（建壳+写 base）。--use 设为全局默认，--link 绑定到当前目录。',
+    flags: { '--base <url>': '实例地址', '--preset <p>': 'cn|global|local', '--use': '设为全局默认', '--link': '绑定到当前目录' },
+    output: '{created, dir, base, linked, next}',
+    examples: ['fastgpt account create 华为 --preset cn --use', 'fastgpt account create 中车 --base https://a.example.com --link']
+  },
+  'account use': { usage: 'fastgpt account use <名字>', about: '切换全局默认账号。', flags: {}, output: '{active}', examples: ['fastgpt account use 华为'] },
+  'account link': { usage: 'fastgpt account link <名字> [--dir <目录>]', about: '在项目目录绑定账号（写 .fastgpt/account，只含名字，可进 git）。', flags: { '--dir <目录>': '绑定到指定目录（默认当前）' }, output: '{linked, file}', examples: ['fastgpt account link 华为'] },
+  'account unlink': { usage: 'fastgpt account unlink [--dir <目录>]', about: '解除当前/指定目录的账号绑定。', flags: {}, output: '{ok}', examples: ['fastgpt account unlink'] },
+  'account remove': { usage: 'fastgpt account remove <名字>', about: '删除账号目录（凭据全清）。', flags: {}, output: '{removed}', examples: ['fastgpt account remove test'] },
+  'dsl pull': {
+    usage: 'fastgpt dsl pull [--appId <advanced应用>] [--out <快照路径>] [--dry-run]',
+    about: '从目标实例自己的前端 chunk 抽取节点模板 + 枚举 → 存版本化 DSL 快照 → 与旧快照 diff。自动升级 DSL 的眼睛。',
+    flags: { '--appId <id>': '用指定 advanced 应用触发完整 bundle 加载', '--out <path>': '快照路径（默认 ~/.fastgpt/dsl-snapshot.json）', '--dry-run': '只展示不写入' },
+    output: 'nodeCount / enums{} / diff{addedNodes,changedNodes,enumDrift} / next',
+    examples: ['fastgpt dsl pull', 'fastgpt dsl pull --dry-run']
+  },
+  'plugin list': { usage: 'fastgpt plugin list [--search <词>]', about: '工具市场插件列表（system 工具市场 + 团队私有工具），id 用于 plugin schema。', flags: { '--search <词>': '按 id/名称过滤' }, output: '数组[{id,name,source,isToolSet,version}]', examples: ['fastgpt plugin list', 'fastgpt plugin list --search markdown'] },
+  'plugin schema': {
+    usage: 'fastgpt plugin schema <toolId> [--version <v>]',
+    about: '插件详情：把插件 inputSchema 推导成 pluginModule 参数，直接产出可用的挂载代码片段。',
+    flags: { '--version <v>': '指定版本（默认最新）' },
+    output: 'params[] / paramsHuman[] / outputs[] / hasSecret / usage',
+    examples: ['fastgpt plugin schema systemTool-markdownTransform', 'fastgpt plugin schema systemTool-feishu']
   },
   'ds tag list': {
     usage: 'fastgpt ds tag list <datasetId>',
@@ -262,6 +314,13 @@ function parseArgs(argv) {
 }
 
 const readJson = p => JSON.parse(fs.readFileSync(p, 'utf8'));
+
+/** 取登录 token；没有就让用户先登录（diffcheck 必须登录态才能读线上画布） */
+const readTokenOrFail = () => {
+  const t = readToken();
+  if (!t) fail('wf diffcheck 需要登录态（读线上画布）。先跑 fastgpt auth scan 或 fastgpt auth login');
+  return t;
+};
 
 
 // ---------- modelId 预检 hook ----------
@@ -1748,12 +1807,179 @@ const commands = {
 
   async 'auth logout'() { client.clearCookie(); out({ ok: true }); },
 
+  // ===== 多账号（实例 × 凭据）=====
+  /** 列出所有账号：名称/域名/版本/登录状态/项目绑定。 */
+  async 'account list'() {
+    const rows = listAccounts();
+    const proj = accountFromProject();
+    out({
+      ok: true,
+      accountsDir: accountsDir(),
+      active: activeAccount(),
+      current: { name: ACCOUNT.name, source: ACCOUNT.source, home: HOME },
+      projectBinding: proj || null,
+      accounts: rows,
+      note: rows.length ? undefined : '还没有账号。新建：fastgpt account create <名字> --preset cn',
+    });
+  },
+
+  /** 显示当前生效的账号及来源。 */
+  async 'account current'() {
+    out({
+      ok: true,
+      name: ACCOUNT.name,
+      source: ACCOUNT.source,   // arg | env | project | active | default
+      home: HOME,
+      base: getBase() || null,
+      projectBinding: accountFromProject() || null,
+      hint: ACCOUNT.name
+        ? undefined
+        : '当前是默认目录（无账号绑定）。cd 进带 .fastgpt/account 的项目，或用 --account <名字> / fastgpt account use <名字>',
+    });
+  },
+
+  /** 切换全局默认账号。 */
+  async 'account use'(args, f) {
+    const name = args[0] || f?.account;
+    if (!name) fail('用法: fastgpt account use <名字>');
+    assertAccountName(name);
+    if (!accountExists(name)) fail(`账号 ${name} 不存在（先 fastgpt account create ${name}）。现有：${listAccounts().map(a => a.name).join(', ') || '无'}`);
+    setActiveAccount(name);
+    out({ ok: true, active: name, note: '已切换全局默认账号。项目目录里的 .fastgpt/account 绑定优先级更高' });
+  },
+
+  /** 清除全局默认账号。 */
+  async 'account unuse'() {
+    clearActiveAccount();
+    out({ ok: true, note: '已清除全局默认账号，回退到 ~/.fastgpt' });
+  },
+
+  /**
+   * 在某个项目目录绑定账号（写 .fastgpt/account）。
+   * 这样 cd 进该目录 / agent 在里面跑，CLI 自动用该账号。绑定文件只含名字，可进 git。
+   */
+  async 'account link'(args, f) {
+    const name = args[0] || f?.account;
+    if (!name) fail('用法: fastgpt account link <名字> [--dir <目录>]');
+    assertAccountName(name);
+    if (!accountExists(name)) fail(`账号 ${name} 不存在（先 fastgpt account create ${name}）`);
+    const p = linkProject(name, f.dir || process.cwd());
+    out({ ok: true, linked: name, file: p, note: '该目录（及子目录）下 agent 调用 CLI 会自动用这个账号' });
+  },
+
+  async 'account unlink'(args, f) {
+    const ok = unlinkProject(f.dir || process.cwd());
+    out({ ok, note: ok ? '已解除当前目录的账号绑定' : '当前目录没有绑定' });
+  },
+
+  /**
+   * 新建账号目录（仅建壳 + 写 base）。login 置空，指导用户下一步。
+   * 创建后可用 --use 设为全局默认，--link 同时绑定到当前目录。
+   */
+  async 'account create'(args, f) {
+    const name = args[0] || f.name;
+    if (!name) fail('用法: fastgpt account create <名字> --base <地址> [--use] [--link]');
+    assertAccountName(name);
+    if (accountExists(name)) fail(`账号 ${name} 已存在，换名字或用 fastgpt account remove ${name}`);
+
+    const preset = f.preset;
+    let base = f.base;
+    if (!base && preset) base = BASE_PRESETS[preset]?.base;
+    if (!base) fail('需要 --base <实例地址> 或 --preset cn|global|local');
+
+    const dir = path.join(accountsDir(), name);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ base: base.replace(/\/$/, '') }, null, 2), { mode: 0o600 });
+    if (f.use) setActiveAccount(name);
+    let linked = null;
+    if (f.link) linked = linkProject(name, process.cwd());
+
+    out({
+      ok: true,
+      created: name,
+      dir,
+      base: base.replace(/\/$/, ''),
+      linked,
+      next: `登录该账号：fastgpt --account ${name} auth scan（或 auth login）`,
+    });
+  },
+
+  /** 删除账号目录（凭据全清）。 */
+  async 'account remove'(args) {
+    const name = args[0];
+    if (!name) fail('用法: fastgpt account remove <名字>');
+    assertAccountName(name);
+    if (!accountExists(name)) fail(`账号 ${name} 不存在`);
+    if (activeAccount() === name) clearActiveAccount();
+    const dir = path.join(accountsDir(), name);
+    fs.rmSync(dir, { recursive: true, force: true });
+    out({ ok: true, removed: name });
+  },
+
   // ===== 模型 =====
   async 'model list'(args, f) {
     const d = await client.get('/api/core/ai/model/list');
     let ms = d.models;
     if (f.type) ms = ms.filter(m => m.type === f.type);
     out(ms.map(m => ({ name: m.name, provider: m.provider, type: m.type, testMode: m.testMode })));
+  },
+
+  /** 工具市场插件列表（含 system 工具市场 + 团队私有工具）。 */
+  async 'plugin list'(args, f) {
+    const d = await client.get('/api/core/plugin/team/tool/list');
+    let list = Array.isArray(d) ? d : (d?.list || []);
+    if (f.search) {
+      const q = String(f.search).toLowerCase();
+      list = list.filter(t => {
+        const nm = typeof t.name === 'object' ? (t.name['zh-CN'] || t.name.en) : t.name;
+        return (t.id || '').toLowerCase().includes(q) || String(nm || '').toLowerCase().includes(q);
+      });
+    }
+    out(list.map(t => {
+      const nm = typeof t.name === 'object' ? (t.name['zh-CN'] || t.name.en) : t.name;
+      return { id: t.id, name: nm, source: t.source, isToolSet: !!t.isToolSet, version: t.version };
+    }));
+  },
+
+  /**
+   * 工具/插件详情：吐 inputSchema 推导的 params（可直接喂 node.pluginModule）。
+   * 用途：
+   *   - 看某个工具市场插件需要什么参数（如 markdown转文件 = markdown/format/filename）
+   *   - 自动生成 pluginModule 节点的 { appId, params }
+   */
+  async 'plugin schema'(args, f) {
+    const toolId = f.toolId || args[0];
+    if (!toolId) fail('用法: fastgpt plugin schema <toolId> [--version <v>]');
+    const q = `toolId=${encodeURIComponent(toolId)}${f.version ? `&version=${encodeURIComponent(f.version)}` : ''}`;
+    const d = await client.get(`/api/core/plugin/team/tool/detail?${q}`);
+    if (!d || !d.id) fail(`未找到工具 ${toolId}（先 fastgpt plugin list 查 id）`);
+
+    const spec = toolDetailToPluginSpec(d);
+    out(withNotice({
+      ok: true,
+      toolId: spec.toolId,
+      version: spec.version,
+      name: spec.name,
+      isToolSet: spec.isToolSet,
+      avatar: spec.avatar,
+      note: spec.note,
+      params: spec.params.map(p => ({
+        key: p.key, label: p.label, valueType: p.valueType,
+        required: p.required, enum: p.enum, default: p.default,
+        description: p.description,
+      })),
+      paramsHuman: describeParams(spec.params),
+      outputs: spec.outputs,
+      hasSecret: !!spec.secretSchema,
+      secretSchema: spec.secretSchema || undefined,
+      // 直接可用的构造代码片段
+      usage: spec.isToolSet
+        ? `工具集，需先展开子工具；不直接生成 pluginModule`
+        : `node.pluginModule('<节点id>', { appId: '${spec.toolId}', params: ${JSON.stringify(spec.params.map(p => ({ key: p.key, label: p.label, valueType: p.valueType })), null, 0)} })`,
+      next: spec.isToolSet
+        ? '这是工具集，用 fastgpt help tool 查看如何展开子工具'
+        : `用它挂进工作流：${spec.hasSecret ? '注意该工具需鉴权（secretSchema 非空），先在网页端配好密钥' : '无需密钥'}；记得用 selectedTools edge 连到 tools/agent 节点`,
+    }));
   },
 
   /**
@@ -2121,6 +2347,76 @@ const commands = {
     if (!r.ok) process.exit(2);
   },
 
+  /**
+   * 前后端校验差分：取真实 workflow → 注入已知缺陷 → 本地 validate 与线上画布各判一次 → 报漂移。
+   * 用途：平台升级后验证「本地规则还跟不跟得上」；改了 validate.mjs 后做回归。
+   */
+  async 'wf diffcheck'(args, f) {
+    const appId = f.appId || args[0];
+    if (!appId) fail('用法: fastgpt wf diffcheck <appId> [--file <本地workflow.json>] [--only id1,id2]');
+
+    // 取底稿：优先 --file，否则从线上 app 读
+    let base;
+    if (f.file) {
+      const d = readJson(f.file);
+      base = { nodes: d.nodes || [], edges: d.edges || [], chatConfig: d.chatConfig || {} };
+    } else {
+      const d = await client.get(`/api/core/app/detail?appId=${appId}`);
+      base = { nodes: d.nodes || [], edges: d.edges || [], chatConfig: d.chatConfig || {} };
+    }
+    if (!base.nodes.length) fail('底稿没有节点，无法做差分（检查 appId 或 --file）');
+
+    const only = f.only ? String(f.only).split(',').map(s => s.trim()).filter(Boolean) : null;
+    const defIds = Object.keys(DEFECTS).filter(k => !only || only.includes(k));
+    const token = readTokenOrFail();
+
+    const rows = [];
+    for (const id of defIds) {
+      // 每个缺陷用独立深拷贝，互不干扰
+      const wf = structuredClone(base);
+      const meta = DEFECTS[id](wf);
+      if (!meta) { rows.push({ id, skipped: '底稿不满足注入条件（缺对应节点类型）' }); continue; }
+      const local = localJudge(wf);
+      let remote;
+      try {
+        remote = await remoteJudge({ base: getBase(), token, wf });
+      } catch (e) {
+        remote = { error: String(e.message).slice(0, 160), publishCode: -1, offenders: [], badTexts: [], pendingCount: 0, canvasOk: false };
+      }
+      const [rec] = reconcile([{ id, desc: meta.desc, localCode: meta.localCode }], local, remote);
+      rows.push({
+        ...rec,
+        local: { ok: local.ok, codes: local.codes, errors: local.errorCount, warnings: local.warningCount },
+        remote: {
+          publishCode: remote.publishCode,
+          rendered: remote.rendered,
+          pendingCount: remote.pendingCount,
+          badTexts: remote.badTexts,
+          offenders: (remote.offenders || []).map(o => ({ nodeId: o.nodeId, title: o.title, issues: o.issues })),
+          skipped: remote.skipped,
+          note: remote.note,
+          error: remote.error,
+        },
+      });
+    }
+
+    const drifts = rows.filter(r => r.drift);
+    out(withNotice({
+      ok: true,
+      appId, file: f.file || null,
+      probed: rows.length,
+      driftCount: drifts.length,
+      summary: {
+        local_miss: drifts.filter(r => r.drift === 'local_miss').length,
+        local_over: drifts.filter(r => r.drift === 'local_over').length,
+      },
+      rows,
+      next: drifts.length
+        ? `有 ${drifts.length} 处漂移：local_miss=本地规则漏（该补 validate.mjs），local_over=本地可能误报（该核规则）`
+        : '本地规则与线上画布判定一致，无漂移',
+    }));
+  },
+
   async 'wf get'(args, f) {
     const appId = f.appId || args[0];
     const d = await client.get(`/api/core/app/detail?appId=${appId}`);
@@ -2414,6 +2710,202 @@ const commands = {
       message: `内置规则集按 ${cmp.calibratedWith} 校准，目标实例是 ${cmp.targetVersion}`,
       hint: '版本不一致不代表一定错，但「平台新增的规则我不知道」这类风险会出现；按 --calibrate 的步骤重新校准'
     }));
+  },
+
+  /**
+   * 节点目录校准：抓线上前端的节点类型枚举，与本地 lib/nodes.mjs 的构造器清单比对。
+   * 和 wf ruleset 同一哲学：本地知识是静态快照，让漂移可见，不自动改代码。
+   */
+  async 'wf nodes'(args, f) {
+    const base = getBase() || 'https://cloud.fastgpt.cn';
+
+    // --calibrate：只给步骤，不抓网（无 Chrome 也能用）
+    if (f.calibrate) {
+      out({ ok: true, target: { base }, local: localNodeCatalog(), calibrate: calibrateNodeCatalog() });
+      return;
+    }
+
+    // 目标版本（尽力拿，拿不到标 unknown）
+    let systemVersion = null;
+    try { const d = await client.get('/api/common/system/getInitData'); systemVersion = d?.systemVersion || null; } catch {}
+
+    // 抓线上节点类型：CDP 打开编辑器 → 拉全部 chunk → 提取 FlowNodeTypeEnum.
+    const token = readTokenOrFail();
+    const tag = 'wf-nodes';
+    const page = await launchBrowserEngine({ base, token, tag });
+    let online = { types: [], avatars: [] };
+    let scanned = 0;
+    try {
+      if (page.skipped) {
+        // 无 Chrome：退化为只报本地清单 + 提示怎么补
+        out(withNotice({
+          ok: true, base, target: { systemVersion: systemVersion || 'unknown' },
+          local: { count: localNodeCatalog().length, nodes: localNodeCatalog() },
+          online: null,
+          skipped: `无法抓取线上节点清单：${page.skipped}`,
+          next: '需要图形界面的 Chrome（或用 FGPT_CHROME 指定）才能抓线上节点枚举；先跑 wf nodes --calibrate 看步骤',
+        }));
+        return;
+      }
+
+      // 关键：空白 /app/detail 只加载壳（~18种节点）；必须用真实 appId 才会加载完整编辑器 bundle（~38种）。
+      // 没给 appId 就自动取一个 advanced 应用。
+      let appId = f.appId || args[0];
+      if (!appId) {
+        try {
+          const apps = await client.post('/api/core/app/listV2', { parentId: null, searchKey: '' });
+          const list = apps.list || apps || [];
+          appId = (list.find(a => a.type === 'advanced') || list[0])?._id || null;
+        } catch {}
+      }
+      await page.navigate(appId
+        ? `${base.replace(/\/$/, '')}/app/detail?appId=${appId}`
+        : `${base.replace(/\/$/, '')}/app/detail`);
+      // 等编辑器起来（真实 appId 会懒加载富编辑器 bundle，需多等一下）
+      await sleepMs(appId ? 7000 : 6000);
+
+      const urls = await page.eval(`JSON.stringify(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>u.endsWith('.js')))`);
+      let list = []; try { list = JSON.parse(urls || '[]'); } catch {}
+
+      const texts = [];
+      for (const u of list) {
+        try {
+          const t = await (await fetch(u)).text();
+          texts.push(t); scanned++;
+        } catch {}
+      }
+      online = extractOnlineNodeTypes(texts);
+    } finally {
+      page.close();
+    }
+
+    // 完整性保护：扫描不完整时不下「缺失」结论（否则网络抖一下 / 壳页就把线上节点全判成没有）。
+    // 经验阈值：完整编辑器 bundle 有 200+ chunk、能抓到 30+ 种节点类型；
+    // 低于此说明只加载了壳（如未登录 / appId 无效 / 应用是 simple 而非 advanced）。
+    const INCOMPLETE_NODE_THRESHOLD = 25;
+    const incomplete = online.types.length < INCOMPLETE_NODE_THRESHOLD;
+
+    const cmp = compareNodeCatalog({ onlineTypes: online.types, targetVersion: systemVersion });
+    out(withNotice({
+      ok: true,
+      base,
+      target: { systemVersion: systemVersion || 'unknown' },
+      appId: f.appId || args[0] || '(auto)',
+      scannedChunks: scanned,
+      incomplete,
+      online: { typeCount: online.types.length, types: online.types, avatarCount: online.avatars.length },
+      local: { count: cmp.localCount, nodes: localNodeCatalog() },
+      compare: incomplete
+        ? { ...cmp, missingLocal: [], extraLocal: [], verdict: 'incomplete',
+            note: `只扫到 ${online.types.length} 种节点（< ${INCOMPLETE_NODE_THRESHOLD}），可能只加载了壳（未登录/ appId 无效/ 非 advanced 应用）——本次不判定缺失/多余` }
+        : cmp,
+      next: incomplete
+        ? `扫描不完整（仅 ${online.types.length} 种，完整约 38 种）：换真实 advanced 应用重试 fastgpt wf nodes --appId <advanced应用>，否则不下缺失结论`
+        : cmp.missingLocal.length
+          ? `线上 ${cmp.missingLocal.length} 种节点本地无构造器（${cmp.missingLocal.slice(0, 8).join(', ')}${cmp.missingLocal.length > 8 ? '…' : ''}）→ 常用的话补进 lib/nodes.mjs；不常用用 node.raw() 手拼`
+          : cmp.extraLocal.length
+            ? `本地 ${cmp.extraLocal.length} 种节点线上没见到（${cmp.extraLocal.join(', ')}）→ 核实是否改名/删除`
+            : '本地构造器覆盖与线上节点枚举一致',
+    }, (!incomplete && cmp.verdict === 'drift') || incomplete ? {
+      type: incomplete ? 'node_catalog_incomplete' : 'node_catalog_drift',
+      message: incomplete
+        ? `节点扫描不完整（${online.types.length} 种），已跳过缺失判定`
+        : `本地构造器按 ${NODE_CATALOG_CALIBRATED_WITH} 校准，线上枚举 ${online.types.length} 种、本地覆盖 ${cmp.coveredCount} 种`,
+      hint: incomplete
+        ? '用 --appId 指向一个真实 advanced 应用重试' 
+        : 'missingLocal 里的节点只能用 node.raw() 手拼，无构造期保护；需要时补构造器并更新 NODE_CATALOG_CALIBRATED_WITH',
+    } : null));
+  },
+
+  /**
+   * dsl pull：从目标实例自己的前端 chunk 抽取节点模板 + 枚举 → 存版本化快照 → 与旧快照 diff。
+   * 这是「自动升级 DSL」的眼睛：平台升级后跑一次，就知道新增/改了哪些节点和字段。
+   * 只用目标实例自己的数据（商业版与开源版可能不同，不拿开源做锚点）。
+   */
+  async 'dsl pull'(args, f) {
+    const base = getBase() || 'https://cloud.fastgpt.cn';
+    const snapshotPath = f.out || path.join(HOME, 'dsl-snapshot.json');
+    const token = readTokenOrFail();
+
+    // 拿实例版本
+    let instanceVersion = null;
+    try { const d = await client.get('/api/common/system/getInitData'); instanceVersion = d?.systemVersion || null; } catch {}
+
+    // 自动取一个 advanced 应用作跳板（真实 app 才加载完整编辑器 bundle）
+    let appId = f.appId || args[0];
+    if (!appId) {
+      try {
+        const apps = await client.post('/api/core/app/listV2', { parentId: null, searchKey: '' });
+        const list = apps.list || apps || [];
+        appId = (list.find(a => a.type === 'advanced') || list[0])?._id || null;
+      } catch {}
+    }
+
+    const page = await launchBrowserEngine({ base, token, tag: 'dsl-pull' });
+    if (page.skipped) fail(`无法拓取前端 chunk：${page.skipped}（需要 Chrome；可用 FGPT_CHROME 指定）`);
+
+    let chunks = [];
+    try {
+      await page.navigate(appId ? `${base.replace(/\/$/, '')}/app/detail?appId=${appId}` : `${base.replace(/\/$/, '')}/app/detail`);
+      await sleepMs(appId ? 7000 : 6000);
+      const urlsRaw = await page.eval(`JSON.stringify(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>u.endsWith('.js')))`);
+      let urls = []; try { urls = JSON.parse(urlsRaw || '[]'); } catch {}
+      for (const u of urls) { try { chunks.push({ url: u, body: await (await fetch(u)).text() }); } catch {} }
+    } finally { page.close(); }
+
+    if (!chunks.length) fail('没拓到任何 chunk（可能未登录或 appId 无效）');
+    const snap = buildSnapshot(chunks, { instanceVersion, base });
+    if (!snap.nodes.length) fail('chunk 里没解析出节点模板（平台 bundle 结构可能变了，解析器需更新）');
+
+    // 缺口核算：枚举里有、但模板没拓到的节点（懒加载 / 未在首批 bundle）
+    const tplTypes = new Set(snap.nodes.map(n => n.flowNodeType));
+    const enumTypes = snap.enums.flowNodeType || [];
+    const noTemplate = enumTypes.filter(t => !tplTypes.has(t));
+
+    // 读旧快照做 diff
+    let prev = null;
+    try { prev = JSON.parse(fs.readFileSync(snapshotPath, 'utf8')); } catch {}
+    const diff = prev ? diffSnapshot(prev, snap) : null;
+
+    // 写快照（除非 --dry-run）
+    if (!f['dry-run']) {
+      fs.mkdirSync(path.dirname(snapshotPath), { recursive: true });
+      fs.writeFileSync(snapshotPath, JSON.stringify(snap, null, 2));
+    }
+
+    out(withNotice({
+      ok: true,
+      base,
+      snapshotFile: f['dry-run'] ? null : snapshotPath,
+      pulledFrom: snap.pulledFrom,
+      parsedChunkCount: snap.parsedChunkCount,
+      nodeCount: snap.nodes.length,
+      enums: {
+        flowNodeType: snap.enums.flowNodeType.length,
+        ioValueType: snap.enums.ioValueType.length,
+        inputType: snap.enums.inputType.length,
+        templateType: snap.enums.templateType.length,
+      },
+      baseline: prev ? `已有快照（${prev.pulledFrom}）` : '首次摄取（无旧快照，无 diff）',
+      coverage: {
+        enumNodeTypes: enumTypes.length,
+        withTemplate: tplTypes.size,
+        noTemplateCount: noTemplate.length,
+        // 这类节点枚举里有、模板未拓到：多为懒加载（首次加该类节点才加载对应 chunk），
+        // 用 node.fromType() 构造时若缺模板会报错，需用 raw() 手拼或推动加载
+        noTemplate,
+      },
+      diff: diff || undefined,
+      next: !prev
+        ? '首次快照已存。以后平台升级再跑 dsl pull 即自动报漂移'
+        : diff.drifted
+          ? `发现漂移：新增节点 ${diff.addedNodes.length}、变更节点 ${diff.changedNodes.length}、枚举变动 ${Object.keys(diff.enumDrift).length} 组。详看 diff 字段`
+          : '节点模板与枚举无漂移',
+    }, diff && diff.drifted ? {
+      type: 'dsl_drift',
+      message: `DSL 快照漂移：新增 ${diff.addedNodes.length} / 变更 ${diff.changedNodes.length} / 删除 ${diff.removedNodes.length}`,
+      hint: '新增节点可用 node.fromType() 通用构造；变更字段（改名/改结构）需核对后用 wf migrate 处理存量',
+    } : diff && diff.drifted ? null : null));
   },
 
   /**
@@ -4043,7 +4535,7 @@ if (!fn) {
 // 已消费的参数层级
 const consumed = key.split(' ').length;
 // 离线命令：不触网，不需要鉴权
-const authGroup = pos[0] === 'auth' || pos[0] === 'help' || pos[0] === 'init' || pos[0] === 'doctor' || pos[0] === 'info' || !pos[0];
+const authGroup = pos[0] === 'auth' || pos[0] === 'account' || pos[0] === 'help' || pos[0] === 'init' || pos[0] === 'doctor' || pos[0] === 'info' || !pos[0];
 // 只有 lint 是离线的（纯语法检查）。dry-run 必须登录，因为它要验证真实 ID。
 const offlineCmds = new Set(['wf lint', 'wf validate']);
 const isOffline = offlineCmds.has(key);

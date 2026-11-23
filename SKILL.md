@@ -228,6 +228,220 @@ forbidden: 不要用 --no-ui-check 跳过校验让命令通过
 - 「禁止做什么」→ `forbidden` 字段 + 本文件红线
 - 只写在文档里 = 大概率没被读，等于没有
 
+### ✅ 节点目录校准：`wf nodes`（节点类型漂移检测）
+
+`lib/nodes.mjs` 的 20 个构造函数是「照某一版平台抄下来的静态快照」。平台新增/改名节点后，
+CLI 不会自动知道 —— 构造器里没有的节点只能手写原生 JSON，没有任何构造期保护。
+
+```
+fastgpt wf nodes [--appId <advanced应用>] [--calibrate]
+```
+
+做法：CDP 打开编辑器 → 拉全部前端 chunk → 提取 `FlowNodeTypeEnum.*` → 与本地构造器清单比对：
+
+| 字段 | 含义 | 该怎么办 |
+|---|---|---|
+| `missingLocal` | 线上有、本地无构造器 | 常用 → 补进 `lib/nodes.mjs`；不常用 → `node.raw()` 手拼 |
+| `extraLocal` | 本地有、线上枚举没见到 | 核实是否改名/删除 |
+| `incomplete` | 扫描不完整（<25 种） | **不判定缺失**，换真实 advanced 应用重试 |
+
+**关键：必须带 `--appId` 指向一个 advanced 应用。** 空白 `/app/detail` 只加载壳（~18 种节点），
+真实应用才会懒加载完整编辑器 bundle（~38 种）。不带时自动取团队第一个 advanced 应用。
+
+**完整性保护**：和 `judgeDatasetRefs` 的 `incomplete` 同一个道理 —— 只扫到壳时下「缺失」结论会把
+线上节点全判成不存在。所以抓到的类型数低于阈值（25）时标 `incomplete`、跳过缺失判定。
+
+**和 `wf ruleset` / `wf diffcheck` 的关系**：
+- `wf ruleset`：校验**规则**（什么算错）的漂移
+- `wf diffcheck`：校验**行为**（本地规则 vs 线上画布）的差分
+- `wf nodes`：**节点清单/类型**（能构造哪些节点）的漂移
+
+三者哲学一致：本地知识是静态快照，平台会漂，**让漂移可见，不自动改代码**。
+
+### ✅ 前后端校验差分：`wf diffcheck`（规则漂移检测）
+画布校验（ui-check）管「这一次能不能发」；差分（diffcheck）管「本地校验规则还准不准」。
+两者共用同一套 headless 引擎（`lib/browser.mjs`），但目的完全不同：
+
+```
+fastgpt wf diffcheck <appId> [--file <本地workflow.json>] [--only defect1,defect2]
+```
+
+做法：取一份**真实 workflow** → 往副本注入一组「已知缺陷」→ 本地 `validateWorkflow` 判一次、
+线上画布（真浏览器渲染）判一次 → 对照报「漂移」。
+
+| 缺陷 id | 注入什么 | 本地该命中 |
+|---|---|---|
+| `isolated_edge` | 删一条边制造孤立节点 | warning（没有任何入边 / 没有任何连线）|
+| `bad_valuetype` | 引用型输入 valueType 改错 | normalize 修，但原样 validate 该提示|
+| `dead_ref_in_code` | 代码里埋引用不存在节点 | 无效变量 |
+| `ifelse_bool` | ifElse 条件值设 boolean | ifelse_value_type |
+| `canedit_const` | canEdit 动态输入塞常量 | canedit_const_value |
+
+输出里每个探测点带 `localHit` / `remoteHit` / `drift`：
+
+- `drift: local_miss` → **本地规则漏**（前端抓到、本地没抓到）→ 该补 `lib/validate.mjs`
+- `drift: local_over` → **本地可能误报**（本地抓、前端放行）→ 该核规则是否过严
+
+**什么时候跑**：
+1. 目标平台升级后（配合 `wf ruleset` 看版本漂移）——确认本地规则是否失准
+2. 改了 `lib/validate.mjs` 后——做回归，防止越改越偏
+3. 想知道「某类坑本地到底能不能拦」时——按缺陷单点测 `--only ifelse_bool`
+
+> 差分不经 normalize（会提前把缺陷「修好」，导致误判成本地能抓）。它喂的是原始脏数据，
+> 所以能如实反映「本地规则面对真实脏输入时，抓不抓得住」。
+
+### ✅ 多账号（多客户实例）：`account` 命令组
+
+面对多个客户实例（域名/账号/版本各异）时，用账号机制隔离。**cd 进项目目录，agent 调 CLI 自动用对应账号。**
+
+**核心模型**：账号 = 实例 × 凭据 × 版本快照，存在 `~/.fastgpt/accounts/<名字>/`；
+项目目录只放一个 `.fastgpt/account`（仅一行名字，**不含密钥，可进 git**）。
+
+```
+~/.fastgpt/
+  accounts/
+    华为/   config.json(域名+版本)  cookies.json  apikey  dsl-snapshot.json
+    中车/   ...
+  active                    # 全局默认账号
+
+~/work/华为/
+  .fastgpt/account          # 一行：华为
+```
+
+**账号解析优先级**（高→低）：
+
+| 优先级 | 来源 | 场景 |
+|---|---|---|
+| 1 | `--account <名字>` | 脚本/循环跑多客户 |
+| 2 | `FASTGPT_ACCOUNT` 环境变量 | CI |
+| 3 | 从 cwd 向上找项目 `.fastgpt/account` | **cd 进去 + agent 自动用** |
+| 4 | `~/.fastgpt/active` | 全局默认（`account use` 写入）|
+| 5 | 无 | 回退 `~/.fastgpt`（向后兼容）|
+
+**命令**：
+
+```bash
+fastgpt account create 华为 --preset cn --use       # 建号 + 设全局默认
+fastgpt account link 华为                            # 当前目录绑定（写 .fastgpt/account）
+fastgpt account list                                 # 所有账号：域名/版本/登录状态
+fastgpt account current                              # 当前用哪个 + 来源
+fastgpt account use 中车                              # 切全局默认
+fastgpt account unuse                                # 清全局默认
+fastgpt account unlink                               # 解除当前目录绑定
+fastgpt account remove 旧客户                         # 删除账号（凭据全清）
+```
+
+**典型工作流**：
+
+```bash
+# 假设你在做华为项目
+mkdir -p ~/work/华为 && cd ~/work/华为
+fastgpt account create 华为 --preset cn --use
+fastgpt --account 华为 auth scan                     # 登录一次
+fastgpt account link 华为                            # 绑定到当前目录
+
+# 之后：在这个目录（或子目录）里任何 fastgpt 命令 + agent 调用，都自动用华为账号
+fastgpt wf build wf.json                            # 自动华为实例 + 华为凭据 + 华为 dsl-snapshot
+```
+
+**安全**：项目 `.fastgpt/account` 只存名字不存密钥；凭据均在 `~/.fastgpt/accounts/<名字>/`（0700，文件 0600）。
+`account list` 只显示登录与否，不打印 token/密码。
+
+> 每个账号有**自己的 dsl-snapshot**（版本不同快照不同），所以多实例下 `dsl pull` / `wf diffcheck` 天然隔离，不会串。
+
+### ✅ DSL 自动升级：`dsl pull`（节点模板快照）
+
+这是「自动升级 DSL」的核心。平台升级会新增/改节点、改字段，而 CLI 的构造器是静态的。
+`dsl pull` 从**目标实例自己的前端 chunk** 抽取节点模板 + 枚举，存成版本化快照，与旧快照 diff。
+
+```
+fastgpt dsl pull [--appId <advanced应用>] [--out <路径>] [--dry-run]
+```
+
+**数据来源（只用目标实例自己的，绝不拿开源版做锚点——商业版与开源版可能不同）**：
+- 内置节点模板：编辑器 bundle 里的对象字面量（`{id:Enum.xxx, templateType, avatar, inputs, outputs}`）
+- 枚举：bundle 里的 `FlowNodeTypeEnum` / `WorkflowIOValueTypeEnum` 等
+- 抽屉方法：平衡括号切对象 → 规整 JS 字面量 → 受限 `new Function` 求值（**不是逆向算法，是“抄它自己发的配置”**）
+
+**输出关键字段**：
+
+| 字段 | 含义 |
+|---|---|
+| `diff.addedNodes` | 平台新增了哪些节点 |
+| `diff.changedNodes` | 哪些老节点改了（avatar/templateType/+inputs/-inputs）|
+| `diff.enumDrift` | 枚举值变动（如新增一个 valueType）|
+| `coverage.noTemplate` | 枚举里有、但模板没拓到的节点（懒加载）|
+
+**互补格局（实测商业版实例）**：
+
+```
+13 个高频节点 → 只有手写构造器（workflowStart/chatNode/code/ifElse 等，工作流骨架）
+10 个低频节点 → 只有快照模板（toolParams/emptyNode/comment/tool/toolSet…，fromType 补上）
+ 8 个         → 两边都没（懒加载未触发：formInput/userSelect/loop…）→ 用 raw() 或先用一次该类节点
+```
+
+**配合 `node.fromType`**：快照里有模板、但 nodes.mjs 没写构造器的节点，可直接通用构造：
+
+```js
+import { loadSnapshot, buildNodeFromTemplate } from './lib/dsl-snapshot.mjs';
+const snap = loadSnapshot();
+const n = buildNodeFromTemplate(snap, 'toolParams', 'n_tp', {
+  name: '工具参数',
+  inputs: [{ key: 'commentText', value: 'hello' }],   // 按 key 合并
+});
+```
+
+**能自动适配什么、不能适配什么（如实标注）**：
+
+| 场景 | 能否自动 |
+|---|---|
+| 平台**新增**节点 | ✅ `dsl pull` 拉到 → `fromType` 可用 |
+| 老节点**加字段** | ✅ 新构造自动带上 |
+| 老节点**字段改名/删除** | ⚠️ 能发现（diff），但迁移要人工确认（无自动映射魔法）|
+| **已存在的工作流**里的老节点 | ⚠️ 不会变，需 `wf migrate` 处理存量 |
+
+> 局限：节点模板可能懒加载（首次加该类节点才加载对应 chunk），所以快照能拿全“首批 bundle
+> 里有的”模板；`coverage.noTemplate` 会如实报缺口。压缩变量名会变，解析靠内容特征而非变量名。
+
+### ✅ 工具市场插件：`plugin list` / `plugin schema`（自动推导插件参数）
+
+工具市场插件（markdown转文件、飞书webhook、钉钉webhook…）是**系统工具**，走统一 API，
+schema 是标准 JSON Schema。把它们挂进工作流需要构造 `pluginModule` 节点，其 inputs 必须按插件
+`inputSchema` 生成——手写极易漏字段。
+
+```
+fastgpt plugin list [--search <词>]          # 列工具（含 system 工具市场 + 团队私有）
+fastgpt plugin schema <toolId>                # 查插件详情 + 自动推导 params
+```
+
+**关键 API**（抓自前端 chunk，实测可用）：
+- `GET /api/core/plugin/team/tool/list` — 团队可用工具列表
+- `GET /api/core/plugin/team/tool/detail?toolId=` — 详情（含 inputSchema/outputSchema/secretSchema）
+
+**`plugin schema` 做的事**：把插件 `inputSchema`（JSON Schema）转成 `pluginModule` 的 params。
+
+```
+$ fastgpt plugin schema systemTool-markdownTransform
+  name: Markdown 转文件 | hasSecret: True
+  params:
+     markdown (string, 必填) — Markdown 内容
+     format   (string, 必填) 枚举[xlsx|docx|pptx] — 转换格式
+     filename (string, 可选) — 文件名
+  outputs: [url]
+  usage: node.pluginModule('<id>', { appId: 'systemTool-markdownTransform', params: [...] })
+```
+
+**三种插件的区别**（`plugin schema` 会自己区分）：
+
+| 类型 | isToolSet | hasSecret | 处理方式 |
+|---|---|---|---|
+| 普通工具（markdown转文件、飞书webhook） | false | 可能要 | 直接 `node.pluginModule(id, {appId, params})` |
+| 需鉴权的工具 | false | **true** | 同上，但**先在网页端配好密钥**（secretSchema 非空） |
+| 工具集（飞书多维表格等） | **true** | — | 不能直接当 pluginModule，需先展开子工具 |
+
+> 工具集的子工具需用 `/api/core/app/tool/getToolSetChildren` 展开——目前 `plugin schema` 会明确
+> 提示它是工具集并拒绝生成 pluginModule，避免你拼出个坏节点。
+
 ### 交付前的唯一入口：`wf verify`
 
 ```
