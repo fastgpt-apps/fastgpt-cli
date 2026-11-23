@@ -492,11 +492,14 @@ fastgpt wf verify <file> [--inline-consts] [--variables '{...}'] [--ui-cmd '...{
 ```
 wf lint  <dsl.json>       纯语法检查（离线，可未登录）—— 不代表可部署
 wf build <dsl.json> --dry-run   需要登录，校验结构 + 验证 modelId/datasetId 真实性
-wf build <dsl.json>             真实写库
+wf build <dsl.json>             真实写库（DSL 无 appId 时自动新建应用，输出 autoCreated+appId）
 chat run                        验证真的能跑
 ```
 
 **`wf build --dry-run` 强制要求登录。** 未登录会 exit 11 并让你去 init。
+
+**appId 可选**：DSL 里不写 `appId`、也没传 `--appId` 时，`wf build` 会在真实部署前自动新建应用
+（含 `pluginInput` → plugin，否则 advanced），输出 `appId` + `autoCreated: true`。把 appId 写回 DSL 避免下次重建。
 
 理由：dry-run 要验证 `modelId` 是否属于当前团队、`datasetId` 是否存在。
 不登录这些验证都做不了，「结构合法」的假象会让人误以为能部署。

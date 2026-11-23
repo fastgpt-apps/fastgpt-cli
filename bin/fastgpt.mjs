@@ -2207,8 +2207,9 @@ const commands = {
     if (!file) fail('需要 DSL 文件路径');
     // 默认内联 canEdit 常量：lint 修过的东西 build 不该再拦一次（--no-inline-consts 关闭）
     const wf = loadWorkflow(file, { ...f, 'inline-consts': f['inline-consts'] !== false });
-    const appId = wf.raw.appId || f.appId;
-    if (!appId) fail('DSL 需要 appId');
+    // appId 可为空：为空时在 dry-run 之后、真实部署前自动新建应用（见下）。
+    // 以前这里直接 fail('DSL 需要 appId')，与“不填就新建”的预期不符。
+    let appId = wf.raw.appId || f.appId;
 
     let { nodes, edges, chatConfig } = wf;
     if (wf.fixes.length) {
@@ -2301,6 +2302,22 @@ const commands = {
       return;
     }
 
+    // 无 appId：真实部署前自动新建应用。
+    // 类型推断：DSL 里只有 pluginInput 节点 → plugin；否则 advanced。
+    // 名称：DSL 的 name / --name / 文件名。
+    let autoCreated = false;
+    if (!appId) {
+      const isPlugin = nodes.length > 0 && nodes.every(n => n.flowNodeType !== 'workflowStart') && nodes.some(n => n.flowNodeType === 'pluginInput');
+      const name = wf.raw.name || f.name || path.basename(file).replace(/\.[^.]+$/, '');
+      appId = await client.post('/api/core/app/create', {
+        name, type: isPlugin ? 'plugin' : 'advanced',
+        avatar: 'core/app/type/workflowFill', intro: wf.raw.intro || ''
+      });
+      autoCreated = true;
+      console.error(`\n\u2795 未提供 appId，已自动新建${isPlugin ? '工具(plugin)' : '应用(advanced)'}：${appId}（${name}）`);
+      console.error(`   后续可直接用这个 appId，或把它写进 DSL 的 "appId" 字段避免重复建。\n`);
+    }
+
     const published = wf.raw.publish !== false;
     await deployWorkflow({ appId, nodes, edges, chatConfig, versionName: wf.raw.versionName, publish: published });
 
@@ -2343,7 +2360,7 @@ const commands = {
       });
     }
 
-    const payload = { ok: true, appId, nodes: nodes.length, edges: edges.length, publish: published,
+    const payload = { ok: true, appId, ...(autoCreated ? { autoCreated: true, autoCreatedHint: `已自动新建应用 ${appId}，建议写回 DSL 的 "appId" 字段避免下次重复建` } : {}), nodes: nodes.length, edges: edges.length, publish: published,
                       // autoFixed：normalize 在提交前自动修掉的问题（valueType 对齐、parentNodeId、
                       // childrenNodeIdList、loopEndInput、x/y → position）。不输出的话，
                       // 「我明明写错了却没报错」会让人以为检查没生效。

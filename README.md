@@ -153,9 +153,13 @@ EOF
 # 4. 先干跑（验证 modelId / datasetId 真实存在）
 fastgpt wf build wf.json --dry-run
 
-# 5. 部署并发布
+# 5. 部署并发布（DSL 里没写 appId 时会自动新建应用，输出 autoCreated+appId）
 fastgpt wf build wf.json
 ```
+
+> **appId 可选**：DSL 里不写 `appId`、也没传 `--appId` 时，`wf build` 会在真实部署前自动新建一个应用
+> （含 `pluginInput` 节点则建 plugin，否则建 advanced），并在输出里返回 `appId` + `autoCreated: true`。
+> 把返回的 appId 写回 DSL 的 `"appId"` 字段，下次就不会重复建。
 
 ### 一条命令跑完全链路：`wf verify`
 
