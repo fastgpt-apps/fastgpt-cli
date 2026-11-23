@@ -322,6 +322,27 @@ const readTokenOrFail = () => {
   return t;
 };
 
+/**
+ * 当前账号的 apikey 路径。统一到账号 HOME（~/.fastgpt 或 accounts/<name>/）。
+ * 不再用 cwd 的 .fastgpt/apikey（换目录就丢、多账号串区）。
+ */
+const apiKeyPath = () => path.join(HOME, 'apikey');
+
+/**
+ * 读 OpenAPI key。优先级：显式参数 > 环境变量 > 账号 HOME 的 apikey > 兼容旧路径 ./.fastgpt/apikey。
+ * 返回 {key, source, path} 或 {key:null}。
+ */
+const readApiKey = (explicitKey, explicitFile) => {
+  if (explicitKey) return { key: explicitKey, source: 'flag' };
+  if (process.env.FASTGPT_APP_KEY) return { key: process.env.FASTGPT_APP_KEY, source: 'env' };
+  const homeKey = explicitFile || apiKeyPath();
+  if (fs.existsSync(homeKey)) return { key: fs.readFileSync(homeKey, 'utf8').trim(), source: 'account', path: homeKey };
+  // 向后兼容：旧版写到当前目录 .fastgpt/apikey 的
+  const legacy = '.fastgpt/apikey';
+  if (fs.existsSync(legacy)) return { key: fs.readFileSync(legacy, 'utf8').trim(), source: 'legacy-cwd', path: legacy };
+  return { key: null };
+};
+
 
 // ---------- modelId 预检 hook ----------
 const MODEL_ID_RE = /^[0-9a-f]{24}$/i;
@@ -816,11 +837,28 @@ async function runWorkflowOnce({ appId, key, variables, question = 'hello', chat
     };
   });
   const unresolved = trace.filter(t => t.unresolved.length);
+  // ★ 防假通过：HTTP 200 + 拿不到轨迹/空答案，不等于“跑通了”。
+  // 之前只判 unresolved.length === 0，导致「发布版本 0 节点、只跑到开始就结束」→ 空 trace → ok:true。
+  // 现在明确要求：① 有节点轨迹（trace 非空）② 有非空回答内容。任一不满足即失败。
+  const realTrace = trace.filter(t => !['workflowStart', 'pluginInput'].includes(t.type));
+  const emptyRun = realTrace.length === 0 && !content.trim();
+  const blankAnswer = !content.trim();
+  let ok = unresolved.length === 0;
+  let failReason = null;
+  if (ok && emptyRun) {
+    ok = false;
+    failReason = '运行时没有产生任何节点轨迹且回答为空——工作流可能只跑到「开始」就结束（常见于发布版本只有 0~1 个节点）';
+  } else if (ok && blankAnswer) {
+    ok = false;
+    failReason = '运行时回答内容为空（choices[0].message.content 为空串）——流程可能没真正执行到输出节点';
+  }
   return {
-    ok: unresolved.length === 0,
+    ok,
     httpStatus: res.status,
     contentLength: content.length,
     outputIsJson: !!contract,
+    ...(failReason ? { error: failReason } : {}),
+    traceNodeCount: realTrace.length,
     Status: contract?.Status,
     DataSetDate: contract?.DataSetDate,
     domains: contract?.DomainList?.map(d => ({ name: d.name, terms: d.termlist?.length ?? 0 })),
@@ -2113,6 +2151,21 @@ const commands = {
       : type === 'iframe'
         ? `${base}/chat/share?shareId=${shareId}&iframe=true`
         : null;
+
+    // ★ type=apikey 时返回的是 outLink 的 shareId，**不是 OpenAPI Key**。
+    // 拿 shareId 当 Bearer 请求 OpenAPI 会 401 unAuthApiKey。两者是不同体系：
+    //   · share/iframe → shareId（匿名分享链接）
+    //   · apikey → 真正的 OpenAPI key，用 fastgpt apikey create 生成
+    if (type === 'apikey') {
+      out({
+        ok: true, shareId, type, appId, name: body.name,
+        warning: '这是分享链接的 shareId，不是 OpenAPI API Key。拿它当 Bearer 请求 /api/v1 会 401 unAuthApiKey',
+        nextCommand: 'fastgpt apikey create --name cli',
+        hint: '若你要调 OpenAPI（/api/v1/chat/completions），用 fastgpt apikey create 生成真 key；shareId 只能用于浏览器分享链接/iframe',
+      });
+      return;
+    }
+
     out({ ok: true, shareId, type, url, appId, name: body.name });
   },
 
@@ -2427,14 +2480,24 @@ const commands = {
 
   async 'wf publish'(args, f) {
     const appId = f.appId || args[0];
+    if (!appId) fail('用法: fastgpt wf publish <appId>');
     const d = await client.get(`/api/core/app/detail?appId=${appId}`);
     await client.post(`/api/core/app/version/publish?appId=${appId}`, {
       nodes: d.nodes, edges: d.edges, chatConfig: d.chatConfig,
       isPublish: true, autoSave: true, versionName: f.name || 'publish'
     });
+    // 发布后回读：服务端会静默剔节点/strip 字段，200 不代表存进去了
+    await new Promise(r => setTimeout(r, 1200));
+    let saved = null;
+    try { saved = await client.get(`/api/core/app/detail?appId=${appId}`); } catch {}
+    const nodeDelta = saved ? { submitted: (d.nodes || []).length, stored: (saved.nodes || []).length } : undefined;
+    const appType = saved?.type || d.type;
     out(withNotice(
-      { ok: true, appId },
-      type === 'plugin' ? Notice.pluginPublished(appId) : Notice.appCreated(appId)
+      { ok: true, appId, nodeDelta,
+        ...(nodeDelta && nodeDelta.submitted !== nodeDelta.stored
+          ? { warning: `发布后节点数从 ${nodeDelta.submitted} 变为 ${nodeDelta.stored}（服务端剔除了结构不合法的节点）` }
+          : {}) },
+      appType === 'plugin' ? Notice.pluginPublished(appId) : Notice.appCreated(appId)
     ));
   },
 
@@ -2600,12 +2663,12 @@ const commands = {
       }
 
       // ⑥ 运行时（没有 apikey 就跳过，不算失败）
-      const keyFile = f.keyFile || '.fastgpt/apikey';
-      const key = f.key || process.env.FASTGPT_APP_KEY || (fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : '');
+      const keyInfo = readApiKey(f.key, f.keyFile);
+      const key = keyInfo.key;
       let variables;
       if (f.variables) { try { variables = JSON.parse(f.variables); } catch { fail('--variables 需要 JSON 字符串'); } }
       if (!key) {
-        push('run', true, { skipped: `没有 API Key（${keyFile}），跳过运行时体检` });
+        push('run', true, { skipped: `没有 API Key（${apiKeyPath()}），跳过运行时体检。先 fastgpt apikey create` });
       } else if (mode === 'shadow') {
         // 影子应用 create 出来之后 OpenAPI 侧还没就绪，调用会返回 409（不是 200 也不是网络错）。
         // 影子模式的价值是验证「能不能部署 + 画布能不能渲染」，运行时校验的权威结果
@@ -2617,9 +2680,10 @@ const commands = {
         const r = await runWorkflowOnce({ appId, key, variables, question: f.q, chatId: f.chatId });
         push('run', r.ok, {
           httpStatus: r.httpStatus, Status: r.Status, DataSetDate: r.DataSetDate,
+          traceNodeCount: r.traceNodeCount, error: r.error,
           domains: r.domains, unresolved: r.unresolvedVariables, trace: r.trace
         });
-        if (!r.ok) stop('run', '运行时不通过：变量没替换或契约异常', r);
+        if (!r.ok) stop('run', r.error || '运行时不通过：变量没替换或契约异常', r);
       }
 
       // ⑦ UI 校验：默认内置画布渲染检查；--ui-cmd 可外挂更细的检查
@@ -2942,7 +3006,7 @@ const commands = {
         if (Array.isArray(d.nodes) && d.nodes.length) { ctx.workflowFile = x; break; }
       } catch {}
     }
-    ctx.apikey = fs.existsSync('.fastgpt/apikey');
+    ctx.apikey = !!readApiKey().key;
     if (!ctx.workflowFile) {
       out({ principle: P, ok: true, next_command: 'fastgpt app list',
             why: '当前目录没有工作流 JSON。若是要改线上已有的，用 wf get <appId> 导出后再处理',
@@ -3254,8 +3318,8 @@ const commands = {
   async 'wf check-run'(args, f) {
     const appId = f.appId || args[0];
     if (!appId) fail('需要 appId');
-    const keyFile = f.keyFile || '.fastgpt/apikey';
-    const key = f.key || process.env.FASTGPT_APP_KEY || (fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : '');
+    const keyInfo = readApiKey(f.key, f.keyFile);
+    const key = keyInfo.key;
     if (!key) fail('缺少 API Key：先 fastgpt apikey create --name cli，或传 --key');
     let variables;
     if (f.variables) {
@@ -4313,7 +4377,9 @@ const commands = {
         ]
       : q;
 
-    const key = f.key || process.env.FASTGPT_APP_KEY || fs.readFileSync('.fastgpt/apikey', 'utf8').trim();
+    const keyInfo = readApiKey(f.key);
+    if (!keyInfo.key) fail(`没有 API Key（${apiKeyPath()}）。先 fastgpt apikey create`, { subtype: 'not_configured' });
+    const key = keyInfo.key;
     const res = await fetch(`${client.base}/api/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
@@ -4359,9 +4425,17 @@ const commands = {
 
   async 'apikey create'(args, f) {
     const key = await client.post('/api/support/openapi/create', { name: f.name || `cli-${Date.now()}` });
-    fs.mkdirSync('.fastgpt', { recursive: true });
-    fs.writeFileSync('.fastgpt/apikey', key, { mode: 0o600 });
-    out({ ok: true, apiKey: key });
+    // 写到当前账号的 HOME（~/.fastgpt 或 accounts/<name>），而不是当前工作目录。
+    // 之前写 './.fastgpt/apikey' 导致：换目录就找不到、多账号串区、chat run 读不到。
+    fs.mkdirSync(HOME, { recursive: true, mode: 0o700 });
+    const keyPath = path.join(HOME, 'apikey');
+    fs.writeFileSync(keyPath, key, { mode: 0o600 });
+    out({
+      ok: true,
+      apiKey: key,
+      savedTo: keyPath,
+      note: '这张 key 已写入当前账号目录，chat run / wf verify 会自动读它；其他账号需各自创建',
+    });
   },
 
   /**
